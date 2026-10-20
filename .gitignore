@@ -12,6 +12,7 @@ config.yml
 permissions.yml
 *.mcpack
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 *.tmp
 *.read-error-*
 .firecrawl/
