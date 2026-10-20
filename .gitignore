@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+build/
+*/build/
+cache/
+logs/
+packs/
+extensions/
+locales/
+custom_mappings/
+config.yml
+permissions.yml
+*.mcpack
+*.jar
+*.tmp
+*.read-error-*
+.firecrawl/

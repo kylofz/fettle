@@ -1,0 +1,6 @@
+id: fettle
+name: Fettle
+main: me.kylofz.fettle.geyser.FettleExtension
+api: 2.12.0
+version: ${version}
+authors: [kylofz]

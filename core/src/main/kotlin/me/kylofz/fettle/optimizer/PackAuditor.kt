@@ -1,0 +1,427 @@
+package me.kylofz.fettle.optimizer
+
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.SequenceInputStream
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.charset.StandardCharsets
+import java.util.Locale
+import java.util.TreeSet
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+
+/** Estimates raster memory for every PNG/JPEG/TGA in the archive, including font glyphs, without decoding whole images. */
+public class PackAuditor {
+    public fun audit(pack: Path): PackAuditReport {
+        require(Files.isRegularFile(pack)) { "Pack does not exist: $pack" }
+
+        var uncompressedBytes = 0L
+        var fileCount = 0
+        var estimatedTextureHandleCount = 0
+        var textureFileCount = 0
+        var textureMemoryBytes = 0L
+        var largestTexturePath: String? = null
+        var largestTextureWidth = 0
+        var largestTextureHeight = 0
+        var largestTextureMemoryBytes = 0L
+        var largestPotentialAtlasTexturePath: String? = null
+        var largestPotentialAtlasTextureMemoryBytes = 0L
+        var potentialAtlasTexturesOverBudgetCount = 0
+        var maxTextureDimension = 0
+        var modelFileCount = 0
+        var maxModelCubes = 0
+        var largestModelPath: String? = null
+        var maxBlockModelCubes = 0
+        var blockModelFilesOver50Cubes = 0
+        var unmeasuredTextureCount = 0
+        var oversizedModelCount = 0
+        var pngAnimationMetadataCount = 0
+        var rootFontGlyphCount = 0
+        var textureReferences = TextureReferenceScan(emptySet(), 0, false, false)
+
+        ZipFile(pack.toFile()).use { zip ->
+            textureReferences = findTextureReferences(zip)
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (entry.isDirectory) continue
+                if (++fileCount > MAX_FILE_COUNT) throw IOException("Pack has more than $MAX_FILE_COUNT files")
+                if (entry.size >= 0L) {
+                    uncompressedBytes = try {
+                        Math.addExact(uncompressedBytes, entry.size)
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Pack's uncompressed size overflows a 64-bit counter")
+                    }
+                }
+
+                val lowerName = entry.name.lowercase(Locale.ROOT)
+                if (lowerName.endsWith(".png.mcmeta")) pngAnimationMetadataCount++
+                if (lowerName.startsWith("font/glyph_") && lowerName.endsWith(".png")) rootFontGlyphCount++
+                if (lowerName.startsWith("models/") && lowerName.endsWith(".json")) {
+                    modelFileCount++
+                    val modelBytes = if (entry.size > MAX_MODEL_BYTES) null else
+                        zip.getInputStream(entry).use { readBounded(it, MAX_MODEL_BYTES) }
+                    if (modelBytes == null) {
+                        oversizedModelCount++
+                    } else {
+                        val cubeCount = totalCubeCount(modelBytes.toString(Charsets.UTF_8))
+                        if (cubeCount > maxModelCubes) {
+                            maxModelCubes = cubeCount
+                            largestModelPath = entry.name
+                        }
+                        if (lowerName.startsWith("models/blocks/")) {
+                            maxBlockModelCubes = maxOf(maxBlockModelCubes, cubeCount)
+                            if (cubeCount > 50) blockModelFilesOver50Cubes++
+                        }
+                    }
+                }
+
+                if (!isTexture(lowerName)) continue
+                textureFileCount++
+                val dimensions = zip.getInputStream(entry).use { readTextureDimensions(lowerName, it) }
+                if (dimensions == null) {
+                    unmeasuredTextureCount++
+                    continue
+                }
+
+                val imageMemoryBytes = dimensions.width.toLong() * dimensions.height.toLong() * 4L
+                textureMemoryBytes = try {
+                    Math.addExact(textureMemoryBytes, imageMemoryBytes)
+                } catch (_: ArithmeticException) {
+                    throw IOException("Texture-memory estimate overflows a 64-bit counter")
+                }
+                if (lowerName in textureReferences.atlasPaths) {
+                    if (imageMemoryBytes > largestPotentialAtlasTextureMemoryBytes) {
+                        largestPotentialAtlasTexturePath = entry.name
+                        largestPotentialAtlasTextureMemoryBytes = imageMemoryBytes
+                    }
+                    if (maxOf(dimensions.width, dimensions.height) > PackAuditReport.CREATOR_TOOLS_ATLAS_MAX_DIMENSION) {
+                        potentialAtlasTexturesOverBudgetCount++
+                    }
+                }
+                maxTextureDimension = maxOf(maxTextureDimension, dimensions.width, dimensions.height)
+                if (imageMemoryBytes > largestTextureMemoryBytes) {
+                    largestTexturePath = entry.name
+                    largestTextureWidth = dimensions.width
+                    largestTextureHeight = dimensions.height
+                    largestTextureMemoryBytes = imageMemoryBytes
+                }
+            }
+        }
+        estimatedTextureHandleCount = textureReferences.estimatedHandleCount
+
+        val warnings = TreeSet<String>()
+        if (uncompressedBytes > 100L * MIB) warnings += "uncompressed pack exceeds 100 MiB"
+        if (fileCount > 2_500) warnings += "pack has more than 2,500 files"
+        if (estimatedTextureHandleCount > PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE) {
+            warnings += "$estimatedTextureHandleCount estimated distinct texture handles exceed Creator Tools' ${PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE}-handle add-on guidance"
+        }
+        if (textureMemoryBytes > 256L * MIB) warnings += "decoded texture estimate exceeds 256 MiB"
+        if (maxTextureDimension > 2_048) warnings += "a texture exceeds 2048px"
+        if (unmeasuredTextureCount > 0) warnings += "$unmeasuredTextureCount textures could not be measured; AUTO cannot verify the decoded texture budget"
+        if (oversizedModelCount > 0) warnings += "$oversizedModelCount model files exceeded the bounded complexity scan"
+        if (pngAnimationMetadataCount > 0) warnings += "$pngAnimationMetadataCount PNG animation metadata files keep their textures at source resolution"
+        if (potentialAtlasTexturesOverBudgetCount > 0) {
+            warnings += "$potentialAtlasTexturesOverBudgetCount potential atlas texture(s) exceed Creator Tools' 256px maximum-dimension guidance"
+        }
+        if (rootFontGlyphCount > 0) {
+            warnings += "$rootFontGlyphCount root font glyph page(s) are outside the documented texts/<language>/font path; Fettle still counts them conservatively"
+        }
+        if (!textureReferences.atlasScanComplete) {
+            warnings += "Atlas references could not be fully scanned; atlas-size guidance is incomplete"
+        }
+        if (!textureReferences.handleScanComplete) {
+            warnings += "Texture-handle references could not be fully scanned; the handle estimate is incomplete"
+        }
+        if (blockModelFilesOver50Cubes > 0) {
+            val modelFiles = if (blockModelFilesOver50Cubes == 1) "1 block model file exceeds" else
+                "$blockModelFilesOver50Cubes block model files exceed"
+            warnings += "$modelFiles 50 cubes (block maximum $maxBlockModelCubes); Microsoft's guidance targets frequently placed block models"
+        }
+
+        return PackAuditReport(
+            archiveBytes = Files.size(pack),
+            uncompressedBytes = uncompressedBytes,
+            fileCount = fileCount,
+            estimatedTextureHandleCount = estimatedTextureHandleCount,
+            textureFileCount = textureFileCount,
+            textureMemoryBytes = textureMemoryBytes,
+            largestTexturePath = largestTexturePath,
+            largestTextureWidth = largestTextureWidth,
+            largestTextureHeight = largestTextureHeight,
+            largestTextureMemoryBytes = largestTextureMemoryBytes,
+            largestPotentialAtlasTexturePath = largestPotentialAtlasTexturePath,
+            largestPotentialAtlasTextureMemoryBytes = largestPotentialAtlasTextureMemoryBytes,
+            potentialAtlasTexturesOverBudgetCount = potentialAtlasTexturesOverBudgetCount,
+            maxTextureDimension = maxTextureDimension,
+            modelFileCount = modelFileCount,
+            maxModelCubes = maxModelCubes,
+            largestModelPath = largestModelPath,
+            textureMetricsComplete = unmeasuredTextureCount == 0,
+            atlasReferenceScanComplete = textureReferences.atlasScanComplete,
+            textureHandleScanComplete = textureReferences.handleScanComplete,
+            unmeasuredTextureCount = unmeasuredTextureCount,
+            pngAnimationMetadataCount = pngAnimationMetadataCount,
+            warnings = warnings.toList(),
+        )
+    }
+
+    private fun readTextureDimensions(name: String, input: InputStream): Dimensions? {
+        val prefix = input.readNBytes(18)
+        if (name.endsWith(".png")) {
+            if (prefix.size < 18 || !prefix.copyOfRange(0, 8).contentEquals(PNG_SIGNATURE) ||
+                !prefix.copyOfRange(8, 16).contentEquals(PNG_IHDR_PREFIX)
+            ) return null
+            val remainder = input.readNBytes(6)
+            if (remainder.size != 6) return null
+            val header = prefix + remainder
+            return dimensions(readBigEndianInt(header, 16), readBigEndianInt(header, 20))
+        }
+        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+            return jpegDimensions(SequenceInputStream(ByteArrayInputStream(prefix), input))
+        }
+        if (name.endsWith(".tga")) {
+            if (prefix.size < 18) return null
+            val imageType = prefix[2].toInt() and 0xff
+            if (imageType !in setOf(1, 2, 3, 9, 10, 11)) return null
+            val pixelDepth = prefix[16].toInt() and 0xff
+            if (pixelDepth !in setOf(8, 15, 16, 24, 32)) return null
+            val width = (prefix[12].toInt() and 0xff) or ((prefix[13].toInt() and 0xff) shl 8)
+            val height = (prefix[14].toInt() and 0xff) or ((prefix[15].toInt() and 0xff) shl 8)
+            return dimensions(width, height)
+        }
+        return null
+    }
+
+    private fun jpegDimensions(input: InputStream): Dimensions? {
+        if (input.readNBytes(2).contentEquals(byteArrayOf(0xff.toByte(), 0xd8.toByte())).not()) return null
+        var scanned = 2
+        while (scanned < MAX_JPEG_HEADER_BYTES) {
+            if (input.read() != 0xff) return null
+            scanned++
+            var marker = input.read()
+            if (marker < 0) return null
+            scanned++
+            while (marker == 0xff) {
+                marker = input.read()
+                if (marker < 0) return null
+                scanned++
+            }
+            if (marker == 0x00) return null
+            if (marker == 0xd9 || marker == 0xda) return null
+            if (marker == 0xd8 || marker == 0x01 || marker in 0xd0..0xd7) continue
+
+            val segmentLength = readUnsignedShort(input) ?: return null
+            scanned += 2
+            if (segmentLength < 2 || scanned + segmentLength - 2 > MAX_JPEG_HEADER_BYTES) return null
+            if (isJpegStartOfFrame(marker)) {
+                if (segmentLength < 8) return null
+                if (input.read() < 0) return null // precision
+                val height = readUnsignedShort(input) ?: return null
+                val width = readUnsignedShort(input) ?: return null
+                return dimensions(width, height)
+            }
+            if (!skipExactly(input, segmentLength - 2)) return null
+            scanned += segmentLength - 2
+        }
+        return null
+    }
+
+    private fun readBounded(input: InputStream, maximumBytes: Int): ByteArray? {
+        val output = ByteArrayOutputStream(minOf(maximumBytes, 8 * 1024))
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) return output.toByteArray()
+            total += read
+            if (total > maximumBytes) return null
+            output.write(buffer, 0, read)
+        }
+    }
+
+    private fun totalCubeCount(json: String): Int {
+        var total = 0
+        for (match in CUBE_ARRAY_START.findAll(json)) {
+            var arrayDepth = 1
+            var objectDepth = 0
+            var count = 0
+            var inString = false
+            var escaped = false
+            for (index in match.range.last + 1 until json.length) {
+                val character = json[index]
+                if (inString) {
+                    when {
+                        escaped -> escaped = false
+                        character == '\\' -> escaped = true
+                        character == '"' -> inString = false
+                    }
+                    continue
+                }
+                when (character) {
+                    '"' -> inString = true
+                    '[' -> arrayDepth++
+                    ']' -> {
+                        arrayDepth--
+                        if (arrayDepth == 0) break
+                    }
+                    '{' -> {
+                        if (arrayDepth == 1 && objectDepth == 0) count++
+                        objectDepth++
+                    }
+                    '}' -> objectDepth--
+                }
+            }
+            if (Int.MAX_VALUE - total < count) return Int.MAX_VALUE
+            total += count
+        }
+        return total
+    }
+
+    private fun skipExactly(input: InputStream, byteCount: Int): Boolean {
+        var remaining = byteCount
+        while (remaining > 0) {
+            val skipped = input.skip(remaining.toLong()).toInt()
+            if (skipped > 0) {
+                remaining -= skipped
+            } else {
+                if (input.read() < 0) return false
+                remaining--
+            }
+        }
+        return true
+    }
+
+    private fun readUnsignedShort(input: InputStream): Int? {
+        val high = input.read()
+        val low = input.read()
+        if (high < 0 || low < 0) return null
+        return (high shl 8) or low
+    }
+
+    private fun readBigEndianInt(bytes: ByteArray, offset: Int): Int {
+        return ((bytes[offset].toLong() and 0xff) shl 24 or
+            ((bytes[offset + 1].toLong() and 0xff) shl 16) or
+            ((bytes[offset + 2].toLong() and 0xff) shl 8) or
+            (bytes[offset + 3].toLong() and 0xff)).toInt()
+    }
+
+    private fun dimensions(width: Int, height: Int): Dimensions? =
+        if (width in 1..MAX_TEXTURE_DIMENSION && height in 1..MAX_TEXTURE_DIMENSION) Dimensions(width, height) else null
+
+    private fun isJpegStartOfFrame(marker: Int): Boolean =
+        marker in 0xc0..0xc3 || marker in 0xc5..0xc7 || marker in 0xc9..0xcb || marker in 0xcd..0xcf
+
+    private fun isTexture(name: String): Boolean =
+        name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".tga")
+
+    private fun findTextureReferences(zip: ZipFile): TextureReferenceScan {
+        val atlasPaths = HashSet<String>()
+        val handlePaths = HashSet<String>()
+        var scannedBytes = 0L
+        var scannedFiles = 0
+        var atlasScanComplete = true
+        var handleScanComplete = true
+        val entries = zip.entries()
+        while (entries.hasMoreElements()) {
+            val entry = entries.nextElement()
+            if (entry.isDirectory) continue
+            val name = entry.name.lowercase(Locale.ROOT)
+            val atlasSource = isAtlasReferenceSource(name)
+            val handleSource = isTextureHandleReferenceSource(name)
+            if (!atlasSource && !handleSource) continue
+            if (++scannedFiles > MAX_TEXTURE_REFERENCE_FILES) return TextureReferenceScan(atlasPaths, handlePaths.size, false, false)
+            val bytes = zip.getInputStream(entry).use { readBounded(it, MAX_ATLAS_REFERENCE_FILE_BYTES) }
+            if (bytes == null) {
+                if (atlasSource) atlasScanComplete = false
+                if (handleSource) handleScanComplete = false
+                continue
+            }
+            if (scannedBytes > MAX_ATLAS_REFERENCE_TOTAL_BYTES - bytes.size) {
+                return TextureReferenceScan(atlasPaths, handlePaths.size, false, false)
+            }
+            scannedBytes += bytes.size
+            val text = try {
+                StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString()
+            } catch (_: CharacterCodingException) {
+                if (atlasSource) atlasScanComplete = false
+                if (handleSource) handleScanComplete = false
+                continue
+            }
+            val strings = JsonStringScanner.read(text)
+            if (strings == null) {
+                if (atlasSource) atlasScanComplete = false
+                if (handleSource) handleScanComplete = false
+                continue
+            }
+            if (atlasSource) strings.mapNotNullTo(atlasPaths, ::atlasTexturePath)
+            if (handleSource) strings.mapNotNullTo(handlePaths, ::textureHandlePath)
+        }
+        return TextureReferenceScan(atlasPaths, handlePaths.size, atlasScanComplete, handleScanComplete)
+    }
+
+    private fun isAtlasReferenceSource(name: String): Boolean =
+        name == "textures/item_texture.json" || name == "textures/terrain_texture.json" ||
+            name.startsWith("attachables/") && name.endsWith(".json")
+
+    private fun isTextureHandleReferenceSource(name: String): Boolean =
+        // shortcut: path-like strings in these schemas match Creator Tools' handle sources; add schema parsing for new forms.
+        name.startsWith("entity/") && name.endsWith(".json") ||
+            name.startsWith("attachables/") && name.endsWith(".json") ||
+            name.startsWith("particles/") && name.endsWith(".json") ||
+            name.startsWith("ui/") && name.endsWith(".json") ||
+            name == "textures/flipbook_textures.json"
+
+    private fun textureHandlePath(value: String): String? {
+        val raw = value.trim()
+        if (!raw.startsWith("textures/", ignoreCase = true) || raw.contains('\\') || raw.split('/').any { it == ".." }) {
+            return null
+        }
+        return raw.lowercase(Locale.ROOT)
+    }
+
+    private fun atlasTexturePath(value: String): String? {
+        val raw = value.substringBefore('#').trim()
+        if (raw.isEmpty() || raw.startsWith('/') || raw.contains('\\') || raw.split('/').any { it == ".." }) return null
+        val path = if (raw.startsWith("textures/", ignoreCase = true)) raw else "textures/$raw"
+        return when {
+            path.endsWith(".png", ignoreCase = true) || path.endsWith(".jpg", ignoreCase = true) ||
+                path.endsWith(".jpeg", ignoreCase = true) || path.endsWith(".tga", ignoreCase = true) ->
+                path.lowercase(Locale.ROOT)
+            path.substringAfterLast('/').contains('.') -> null
+            else -> ("$path.png").lowercase(Locale.ROOT)
+        }
+    }
+
+    private data class Dimensions(val width: Int, val height: Int)
+    private data class TextureReferenceScan(
+        val atlasPaths: Set<String>,
+        val estimatedHandleCount: Int,
+        val atlasScanComplete: Boolean,
+        val handleScanComplete: Boolean,
+    )
+
+    private companion object {
+        const val MIB = 1024L * 1024L
+        const val MAX_TEXTURE_REFERENCE_FILES = 10_000
+        const val MAX_ATLAS_REFERENCE_FILE_BYTES = 4 * 1024 * 1024
+        const val MAX_ATLAS_REFERENCE_TOTAL_BYTES = 64L * MIB
+        const val MAX_FILE_COUNT = 100_000
+        const val MAX_MODEL_BYTES = 4 * 1024 * 1024
+        const val MAX_JPEG_HEADER_BYTES = 1024 * 1024
+        const val MAX_TEXTURE_DIMENSION = 32_768
+        val CUBE_ARRAY_START = Regex("\"cubes\"\\s*:\\s*\\[")
+        val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+        val PNG_IHDR_PREFIX = byteArrayOf(0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52)
+    }
+}
