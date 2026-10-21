@@ -7,8 +7,15 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 
+public enum class MemoryTierClaimStatus {
+    VALID,
+    MISSING,
+    INVALID,
+    UNDECODABLE,
+}
+
 /** Client-reported Bedrock capability hints, not verified hardware measurements. */
-public data class BedrockDeviceCapabilities(
+public data class BedrockDeviceCapabilities @JvmOverloads constructor(
     public val platform: String?,
     public val deviceOs: Int?,
     public val deviceModel: String?,
@@ -17,15 +24,26 @@ public data class BedrockDeviceCapabilities(
     public val graphicsMode: Int?,
     public val compatibleWithClientSideChunkGen: Boolean?,
     public val gameVersion: String?,
+    public val clientDataDecoded: Boolean = false,
+    public val deviceOsLabel: String? = null,
+    public val memoryTierClaimPresent: Boolean = false,
 ) {
     public val memoryTierDescription: String
         get() = when (memoryTier) {
-            0 -> "SuperLow (up to 1.5 GB)"
-            1 -> "Low (up to 2 GB)"
-            2 -> "Mid (up to 4 GB)"
-            3 -> "High (up to 8 GB)"
-            4 -> "SuperHigh (over 8 GB)"
+            0 -> "SuperLow (roughly <1.5 GB RAM)"
+            1 -> "Low (roughly <2 GB RAM)"
+            2 -> "Mid (roughly <4 GB RAM)"
+            3 -> "High (roughly <8 GB RAM)"
+            4 -> "SuperHigh (roughly >8 GB RAM)"
             else -> "unknown"
+        }
+
+    public val memoryTierClaimStatus: MemoryTierClaimStatus
+        get() = when {
+            memoryTier != null -> MemoryTierClaimStatus.VALID
+            !clientDataDecoded -> MemoryTierClaimStatus.UNDECODABLE
+            !memoryTierClaimPresent -> MemoryTierClaimStatus.MISSING
+            else -> MemoryTierClaimStatus.INVALID
         }
 
     /** Fills identity fields Geyser already parsed when the original client-data string is unavailable. */
@@ -33,11 +51,25 @@ public data class BedrockDeviceCapabilities(
         geyserDeviceOs: Int?,
         geyserDeviceModel: String?,
         geyserGameVersion: String?,
-    ): BedrockDeviceCapabilities = copy(
-        deviceOs = deviceOs ?: geyserDeviceOs?.takeIf { it in 1..15 },
-        deviceModel = deviceModel ?: validatedClientString(geyserDeviceModel, 128),
-        gameVersion = gameVersion ?: validatedClientString(geyserGameVersion, 64),
+    ): BedrockDeviceCapabilities = withGeyserParsedIdentity(
+        geyserDeviceOs, geyserDeviceModel, geyserGameVersion, null
     )
+
+    public fun withGeyserParsedIdentity(
+        geyserDeviceOs: Int?,
+        geyserDeviceModel: String?,
+        geyserGameVersion: String?,
+        geyserDeviceOsLabel: String?,
+    ): BedrockDeviceCapabilities {
+        val parsedDeviceOs = geyserDeviceOs?.takeIf { it in 1..15 }
+        return copy(
+            deviceOs = deviceOs ?: parsedDeviceOs,
+            deviceModel = deviceModel ?: validatedClientString(geyserDeviceModel, 128),
+            gameVersion = gameVersion ?: validatedClientString(geyserGameVersion, 64),
+            deviceOsLabel = deviceOsLabel ?: validatedClientString(geyserDeviceOsLabel, 32)
+                ?.takeIf { deviceOs == null || deviceOs == parsedDeviceOs },
+        )
+    }
 
     public companion object {
         private const val MAX_JWT_CHARS = 2 * 1024 * 1024
@@ -84,6 +116,8 @@ public data class BedrockDeviceCapabilities(
                 graphicsMode = fields.integer("GraphicsMode", 0..32),
                 compatibleWithClientSideChunkGen = fields.boolean("CompatibleWithClientSideChunkGen"),
                 gameVersion = validatedClientString(fields.string("GameVersion"), 64),
+                clientDataDecoded = true,
+                memoryTierClaimPresent = fields.containsKey("MemoryTier"),
             )
         }
 

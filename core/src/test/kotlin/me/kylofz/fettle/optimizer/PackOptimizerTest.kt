@@ -9,6 +9,7 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Comparator
+import java.util.UUID
 import java.util.zip.CRC32
 import java.util.zip.DeflaterOutputStream
 import javax.imageio.IIOImage
@@ -75,6 +76,65 @@ class PackOptimizerTest {
         val hash = PngOptimizer.decodedPixelHash(rgbaPng)
         assertTrue(hash != null && hash.contentEquals(PngOptimizer.decodedPixelHash(palettePng)))
         assertTrue(PngOptimizer.sameDecodedPixels(rgbaPng, palettePng))
+    }
+
+    @Test
+    fun pngReencodingKeepsExactPixelsForHighColorOpaqueAndAlphaImages() {
+        for (transparent in listOf(false, true)) {
+            val image = BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB)
+            for (y in 0 until image.height) for (x in 0 until image.width) {
+                val alpha = if (transparent && (x + y) % 3 == 0) 0x80 else 0xff
+                image.setRGB(x, y, (alpha shl 24) or (((x * 31) and 0xff) shl 16) or
+                        (((y * 29) and 0xff) shl 8) or ((x * 17 + y * 13) and 0xff))
+            }
+            val source = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            val optimized = PngOptimizer.optimizeIfSmaller(source)
+
+            assertTrue(PngOptimizer.sameDecodedPixels(source, optimized), "transparent=$transparent")
+        }
+    }
+
+    @Test
+    fun losslessPaletteEncodingPreservesAllBytePaletteIndices() {
+        val image = BufferedImage(256, 1, BufferedImage.TYPE_INT_ARGB)
+        for (index in 0..255) image.setRGB(index, 0, 0xff000000.toInt() or index)
+        val source = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+
+        val encoded = PngOptimizer.encodeLossless(image)
+
+        assertTrue(encoded != null)
+        assertTrue(PngOptimizer.sameDecodedPixels(source, encoded))
+    }
+
+    @Test
+    fun decodedCropPixelHashMatchesEquivalentPngEncodings() {
+        val image = BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB)
+        for (y in 0 until image.height) for (x in 0 until image.width) {
+            image.setRGB(x, y, when ((x + y) % 4) {
+                0 -> 0x00000000
+                1 -> 0x80ff0000.toInt()
+                2 -> 0xff00ff00.toInt()
+                else -> 0xff0000ff.toInt()
+            })
+        }
+        val rgba = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+        val indexed = indexedPng(image)
+        val crop = TextureCrop(4, 6, 16, 12, image.width, image.height)
+        val rgbaHash = PngOptimizer.decodedCropPixelHash(rgba, crop) ?: error("Could not hash RGBA crop")
+        val indexedHash = PngOptimizer.decodedCropPixelHash(indexed, crop) ?: error("Could not hash indexed crop")
+        val encodedCrop = PngOptimizer.cropRegion(rgba, crop) ?: error("Could not encode crop")
+        val encodedHash = PngOptimizer.decodedPixelHash(encodedCrop) ?: error("Could not hash encoded crop")
+
+        assertContentEquals(rgbaHash, indexedHash)
+        assertContentEquals(rgbaHash, encodedHash)
+        val rgbaCropImage = PngOptimizer.cropImage(rgba, crop) ?: error("Could not read RGBA crop")
+        val croppedImage = PngOptimizer.cropImage(indexed, crop) ?: error("Could not read indexed crop")
+        assertTrue(PngOptimizer.samePixels(rgbaCropImage, croppedImage))
+        assertEquals(crop.width, croppedImage.width)
+        assertEquals(crop.height, croppedImage.height)
+        for (y in 0 until crop.height) for (x in 0 until crop.width) {
+            assertEquals(image.getRGB(crop.x + x, crop.y + y), croppedImage.getRGB(x, y))
+        }
     }
 
     @Test
@@ -394,10 +454,41 @@ class PackOptimizerTest {
         assertEquals(source.getRGB(1, 0), atlas.getRGB(2, 1))
         assertEquals(source.getRGB(0, 1), atlas.getRGB(1, 2))
         assertEquals(source.getRGB(1, 1), atlas.getRGB(2, 2))
+        assertEquals(Color.RED.rgb, atlas.getRGB(1, 0))
+        assertEquals(Color.GREEN.rgb, atlas.getRGB(2, 0))
+        assertEquals(Color.BLUE.rgb, atlas.getRGB(1, 3))
+        assertEquals(Color.WHITE.rgb, atlas.getRGB(2, 3))
+        assertEquals(Color.RED.rgb, atlas.getRGB(0, 1))
+        assertEquals(Color.BLUE.rgb, atlas.getRGB(0, 2))
+        assertEquals(Color.GREEN.rgb, atlas.getRGB(3, 1))
+        assertEquals(Color.WHITE.rgb, atlas.getRGB(3, 2))
         assertEquals(Color.RED.rgb, atlas.getRGB(0, 0))
         assertEquals(Color.GREEN.rgb, atlas.getRGB(3, 0))
         assertEquals(Color.BLUE.rgb, atlas.getRGB(0, 3))
         assertEquals(Color.WHITE.rgb, atlas.getRGB(3, 3))
+    }
+
+    @Test
+    fun pngAtlasCopiesIndexedTransparentPixelsAndTheirGuttersExactly() {
+        val source = BufferedImage(2, 2, BufferedImage.TYPE_INT_ARGB).apply {
+            setRGB(0, 0, 0x00000000)
+            setRGB(1, 0, 0x80ff0000.toInt())
+            setRGB(0, 1, 0xff00ff00.toInt())
+            setRGB(1, 1, 0xff0000ff.toInt())
+        }
+        val indexed = indexedPng(source)
+        val decodedSource = ImageIO.read(ByteArrayInputStream(indexed))
+        val atlasBuilder = PngAtlasBuilder(4, 4)
+
+        assertEquals(3, indexed[25].toInt() and 0xff)
+        assertTrue(atlasBuilder.add(indexed, 1, 1, 1))
+        val atlas = ImageIO.read(ByteArrayInputStream(atlasBuilder.encode() ?: error("Atlas encoding failed")))
+
+        for (y in 0..3) for (x in 0..3) {
+            val sourceX = (x - 1).coerceIn(0, 1)
+            val sourceY = (y - 1).coerceIn(0, 1)
+            assertEquals(decodedSource.getRGB(sourceX, sourceY), atlas.getRGB(x, y), "pixel $x,$y changed")
+        }
     }
 
     @Test
@@ -429,12 +520,14 @@ class PackOptimizerTest {
             ))
 
             PackOptimizer().optimizeForLowEnd(input, output)
-
-            ZipFile(output.toFile()).use { zip ->
-                val atlasPath = Regex("""textures/entity/fettle/atlases/[^"]+""")
+            val firstAtlasPath = ZipFile(output.toFile()).use { zip ->
+                Regex("""textures/entity/fettle/atlases/[^"]+""")
                     .find(zip.getInputStream(zip.getEntry("attachables/full.json"))
                         .use { it.readBytes().decodeToString() })?.value ?: error("Atlas path missing")
-                val atlas = ImageIO.read(zip.getInputStream(zip.getEntry("$atlasPath.png")))
+            }
+
+            ZipFile(output.toFile()).use { zip ->
+                val atlas = ImageIO.read(zip.getInputStream(zip.getEntry("$firstAtlasPath.png")))
                 assertEquals(32, atlas.width)
                 assertEquals(18, atlas.height)
                 val fullGeometry = zip.getInputStream(zip.getEntry("models/entity/full.geo.json"))
@@ -447,6 +540,19 @@ class PackOptimizerTest {
                 assertTrue(croppedGeometry.contains("\"uv\":[23,5]"))
                 assertEquals(ImageIO.read(ByteArrayInputStream(full)).getRGB(0, 0), atlas.getRGB(1, 1))
                 assertEquals(ImageIO.read(ByteArrayInputStream(cropped)).getRGB(8, 8), atlas.getRGB(23, 5))
+            }
+
+            val protectedOutput = root.resolve("atlas-fixed-path-collision.mcpack")
+            PackOptimizer().optimizeForLowEndSet(
+                listOf(input), listOf(protectedOutput), 0, emptyList(), setOf("$firstAtlasPath.png"),
+            )
+            ZipFile(protectedOutput.toFile()).use { zip ->
+                val attachable = zip.getInputStream(zip.getEntry("attachables/full.json"))
+                    .use { it.readBytes().decodeToString() }
+                val rewrittenAtlas = Regex("""textures/entity/fettle/atlases/[^"]+""")
+                    .find(attachable)?.value ?: error("Protected atlas path missing")
+                assertTrue(rewrittenAtlas != firstAtlasPath)
+                assertTrue(zip.getEntry("$rewrittenAtlas.png") != null)
             }
         }
     }
@@ -502,6 +608,48 @@ class PackOptimizerTest {
                 assertEquals("{\"new\":true}",
                     zip.getInputStream(zip.getEntry("manifest.json")).readBytes().decodeToString())
             }
+        }
+    }
+
+    @Test
+    fun packSetRewriteChangesOnlyTheRootHeaderUuid() {
+        withTempDirectory { root ->
+            val input = root.resolve("input.mcpack")
+            val output = root.resolve("output.mcpack")
+            val sourceUuid = "2b2de2dd-aea9-4f60-92d4-1a99622b1c8f"
+            val moduleUuid = "5a9a160a-d25e-4e26-9d99-2952d387f7a6"
+            val replacementUuid = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f")
+            val manifest = """{"format_version":2,"header":{"name":"demo","uuid":"$sourceUuid","version":[1,0,0]},"modules":[{"uuid":"$moduleUuid"}]}"""
+            val texture = byteArrayOf(1, 2, 3, 4)
+            writePack(input, mapOf("manifest.json" to manifest.toByteArray(), "textures/demo.png" to texture))
+
+            PackOptimizer().optimizeResizedPackSet(listOf(input), listOf(output), 0, listOf(replacementUuid))
+
+            ZipFile(output.toFile()).use { zip ->
+                val rewritten = zip.getInputStream(zip.getEntry("manifest.json")).readBytes().decodeToString()
+                assertTrue(rewritten.contains("\"uuid\":\"$replacementUuid\""))
+                assertTrue(rewritten.contains("\"uuid\":\"$moduleUuid\""))
+                assertContentEquals(texture, zip.getInputStream(zip.getEntry("textures/demo.png")).readBytes())
+            }
+        }
+    }
+
+    @Test
+    fun packSetRewriteRejectsAmbiguousHeaderUuid() {
+        withTempDirectory { root ->
+            val input = root.resolve("input.mcpack")
+            val output = root.resolve("output.mcpack")
+            writePack(input, mapOf(
+                "manifest.json" to "{\"header\":{\"uuid\":\"2b2de2dd-aea9-4f60-92d4-1a99622b1c8f\",\"uuid\":\"3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f\"}}".toByteArray(),
+            ))
+
+            assertFailsWith<IOException> {
+                PackOptimizer().optimizeResizedPackSet(
+                    listOf(input), listOf(output), 0,
+                    listOf(UUID.fromString("4d4de4ff-cf09-6f80-b4f6-3c99622b1d0f")),
+                )
+            }
+            assertFalse(Files.exists(output))
         }
     }
 
@@ -1237,6 +1385,29 @@ class PackOptimizerTest {
     }
 
     @Test
+    fun rawZipCompressionOnlyDeflatesWhenItShrinksTheEntryAndPreservesBytes() {
+        withTempDirectory { root ->
+            val stored = root.resolve("stored.zip")
+            val compressed = root.resolve("compressed.zip")
+            val bytes = ByteArray(16 * 1024)
+
+            RawZipBuilder(stored).use { zip ->
+                zip.addStored("textures/test.png", ByteArrayInputStream(bytes))
+                zip.finish()
+            }
+            RawZipBuilder(compressed).use { zip ->
+                zip.add("textures/test.png", ByteArrayInputStream(bytes))
+                zip.finish()
+            }
+
+            assertTrue(Files.size(compressed) < Files.size(stored))
+            ZipFile(compressed.toFile()).use { zip ->
+                assertContentEquals(bytes, zip.getInputStream(zip.getEntry("textures/test.png")).readAllBytes())
+            }
+        }
+    }
+
+    @Test
     fun losslessRewriteUpdatesEveryFaceInLargeGeometry() {
         withTempDirectory { root ->
             val faceCount = 512
@@ -1353,6 +1524,98 @@ class PackOptimizerTest {
                 val animatedGeometry = zip.getInputStream(zip.getEntry("models/entity/animated.geo.json"))
                     .use { it.readBytes().decodeToString() }
                 assertTrue(animatedGeometry.contains("\"texture_width\":128"))
+            }
+        }
+    }
+
+    @Test
+    fun losslessSetSharesPixelIdenticalAttachableTexturesOnlyInsideLinkedPackGroups() {
+        withTempDirectory { root ->
+            val base = root.resolve("base.mcpack")
+            val overlay = root.resolve("overlay.mcpack")
+            val independent = root.resolve("independent.mcpack")
+            val textureSet = root.resolve("texture-set.mcpack")
+            val outputs = listOf("base-out.mcpack", "overlay-out.mcpack", "independent-out.mcpack", "texture-set-out.mcpack")
+                .map(root::resolve)
+            val argb = BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB)
+            val rgb = BufferedImage(16, 16, BufferedImage.TYPE_3BYTE_BGR)
+            for (y in 0 until 16) for (x in 0 until 16) {
+                val pixel = 0xff000000.toInt() or ((x * 13) shl 16) or ((y * 11) shl 8) or (x + y)
+                argb.setRGB(x, y, pixel)
+                rgb.setRGB(x, y, pixel)
+            }
+            val argbPng = ByteArrayOutputStream().also { ImageIO.write(argb, "png", it) }.toByteArray()
+            val rgbPng = ByteArrayOutputStream().also { ImageIO.write(rgb, "png", it) }.toByteArray()
+            assertFalse(argbPng.contentEquals(rgbPng))
+            assertTrue(PngOptimizer.sameDecodedPixels(argbPng, rgbPng))
+
+            fun model(identifier: String) =
+                """{"minecraft:geometry":[{"description":{"identifier":"$identifier"}}]}"""
+            fun attachable(identifier: String, texture: String) =
+                """{"minecraft:attachable":{"description":{"identifier":"$identifier","geometry":{"default":"$identifier"},"textures":{"default":"$texture"}}}}"""
+
+            writePack(base, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "models/entity/shared.geo.json" to model("geometry.scf.shared").toByteArray(),
+                "attachables/base.json" to attachable("geometry.scf.shared", "textures/model/base").toByteArray(),
+                "textures/model/base.png" to argbPng,
+            ))
+            writePack(overlay, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "attachables/overlay.json" to attachable("geometry.scf.shared", "textures/model/frame").toByteArray(),
+                "textures/model/frame.png" to rgbPng,
+            ))
+            writePack(independent, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "models/entity/independent.geo.json" to model("geometry.scf.independent").toByteArray(),
+                "attachables/independent.json" to attachable("geometry.scf.independent", "textures/model/independent").toByteArray(),
+                "textures/model/independent.png" to rgbPng,
+            ))
+            writePack(textureSet, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "attachables/texture-set.json" to attachable("geometry.scf.shared", "textures/model/pbr").toByteArray(),
+                "textures/model/pbr.png" to rgbPng,
+                "textures/model/pbr.texture_set.json" to """{"format_version":"1.21.30","minecraft:texture_set":{"color":[1.0,1.0,1.0,1.0]}}""".toByteArray(),
+            ))
+
+            val reports = PackOptimizer().optimizeForLowEndSet(
+                listOf(base, overlay, independent, textureSet), outputs,
+            )
+
+            assertEquals(1, reports[1].entriesFiltered)
+            ZipFile(outputs[1].toFile()).use { zip ->
+                assertNull(zip.getEntry("textures/model/frame.png"))
+                val rewritten = zip.getInputStream(zip.getEntry("attachables/overlay.json"))
+                    .use { it.readBytes().decodeToString() }
+                assertTrue(rewritten.contains("textures/model/base"))
+            }
+            ZipFile(outputs[2].toFile()).use { zip ->
+                assertTrue(zip.getEntry("textures/model/independent.png") != null)
+            }
+            ZipFile(outputs[3].toFile()).use { zip ->
+                assertTrue(zip.getEntry("textures/model/pbr.png") != null)
+                assertTrue(zip.getEntry("textures/model/pbr.texture_set.json") != null)
+            }
+
+            val withoutLinkGroups = outputs.indices.map { root.resolve("unlinked-$it.mcpack") }
+            PackOptimizer().optimizeForLowEndSet(
+                listOf(base, overlay, independent, textureSet), withoutLinkGroups, 0, emptyList(),
+            )
+            ZipFile(withoutLinkGroups[1].toFile()).use { zip ->
+                assertTrue(zip.getEntry("textures/model/frame.png") != null)
+                val unchanged = zip.getInputStream(zip.getEntry("attachables/overlay.json"))
+                    .use { it.readBytes().decodeToString() }
+                assertTrue(unchanged.contains("textures/model/frame"))
+            }
+
+            val shadowProtectedOutputs = outputs.indices.map { root.resolve("shadow-protected-$it.mcpack") }
+            PackOptimizer().optimizeForLowEndSet(
+                listOf(base, overlay, independent, textureSet), shadowProtectedOutputs, 0,
+                PackOptimizer().linkedPackGroups(listOf(base, overlay, independent, textureSet)),
+                setOf("textures/model/base.png"),
+            )
+            ZipFile(shadowProtectedOutputs[1].toFile()).use { zip ->
+                assertTrue(zip.getEntry("textures/model/frame.png") != null)
             }
         }
     }
@@ -2047,7 +2310,6 @@ class PackOptimizerTest {
             PackOptimizer().optimizeMini(input, output, emptyList(), 256)
 
             ZipFile(output.toFile()).use { zip ->
-                assertEquals(ZipEntry.STORED, zip.getEntry("textures/large.png").method)
                 val resized = ImageIO.read(zip.getInputStream(zip.getEntry("textures/large.png")))
                 assertEquals(256, resized.width)
                 assertEquals(128, resized.height)
@@ -2061,22 +2323,28 @@ class PackOptimizerTest {
             val input = root.resolve("input.mcpack")
             val image = BufferedImage(64, 32, BufferedImage.TYPE_INT_ARGB)
             val png = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            val mediumImage = BufferedImage(32, 16, BufferedImage.TYPE_INT_ARGB)
+            val mediumPng = ByteArrayOutputStream().also { ImageIO.write(mediumImage, "png", it) }.toByteArray()
+            val smallImage = BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB)
+            val smallPng = ByteArrayOutputStream().also { ImageIO.write(smallImage, "png", it) }.toByteArray()
             val fontImage = BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB)
             val fontPng = ByteArrayOutputStream().also { ImageIO.write(fontImage, "png", it) }.toByteArray()
             writePack(input, mapOf(
                 "manifest.json" to "{}".toByteArray(),
                 "textures/item_texture.json" to """{"texture_data":{"a":{"textures":"textures/a"}}}""".toByteArray(),
                 "textures/a.png" to png,
+                "textures/b.png" to mediumPng,
+                "textures/c.png" to smallPng,
                 "font/glyph_E0.png" to fontPng,
                 "models/a.json" to "{\"origin\":[],\"origin\":[]}".toByteArray(),
             ))
 
             val report = PackAuditor().audit(input)
 
-            assertEquals(5, report.fileCount)
+            assertEquals(7, report.fileCount)
             assertTrue(report.atlasReferenceScanComplete)
-            assertEquals(2, report.textureFileCount)
-            assertEquals((64L * 32L + 16L * 16L) * 4L, report.textureMemoryBytes)
+            assertEquals(4, report.textureFileCount)
+            assertEquals((64L * 32L + 32L * 16L + 16L * 16L + 8L * 8L) * 4L, report.textureMemoryBytes)
             assertEquals("textures/a.png", report.largestTexturePath)
             assertEquals(64, report.largestTextureWidth)
             assertEquals(32, report.largestTextureHeight)
@@ -2084,10 +2352,201 @@ class PackOptimizerTest {
             assertEquals(64, report.maxTextureDimension)
             assertEquals("textures/a.png", report.largestPotentialAtlasTexturePath)
             assertEquals(64L * 32L * 4L, report.largestPotentialAtlasTextureMemoryBytes)
+            assertEquals(
+                listOf("textures/a.png", "textures/b.png", "font/glyph_E0.png"),
+                report.textureHotspots.map { it.path },
+            )
             assertEquals(0, report.potentialAtlasTexturesOverBudgetCount)
             assertEquals(1, report.modelFileCount)
             assertEquals(0, report.maxModelCubes)
+            assertEquals(1, report.rootFontGlyphCount)
+            assertEquals(16L * 16L * 4L, report.rootFontGlyphTextureMemoryBytes)
             assertTrue(report.warnings.any { it.contains("root font glyph") })
+        }
+    }
+
+    @Test
+    fun auditWarnsOnCreatorToolsHighestResolutionMipBudget() {
+        withTempDirectory { root ->
+            val input = root.resolve("large-mips.mcpack")
+            fun png(width: Int, height: Int): ByteArray {
+                val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+                for (y in 0 until height) for (x in 0 until width) image.setRGB(x, y, 0xff345678.toInt())
+                return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            }
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "textures/over_mip_budget.png" to png(2048, 1024),
+                "textures/at_mip_budget.png" to png(1024, 1024),
+            ))
+
+            val report = PackAuditor().audit(input)
+
+            assertTrue(report.warnings.any { it.contains("1 textures exceed Creator Tools' 4 MiB") })
+            assertTrue(report.warnings.any { it.contains("textures/over_mip_budget.png") })
+            assertFalse(report.warnings.any { it.contains("a texture exceeds 2048px") })
+        }
+    }
+
+    @Test
+    fun auditWarnsWhenRootPackIconIsNotSquare() {
+        withTempDirectory { root ->
+            val input = root.resolve("non-square-icon.mcpack")
+            val icon = BufferedImage(3, 2, BufferedImage.TYPE_INT_ARGB)
+            val iconBytes = ByteArrayOutputStream().also { ImageIO.write(icon, "png", it) }.toByteArray()
+            writePack(input, mapOf("manifest.json" to "{}".toByteArray(), "pack_icon.png" to iconBytes))
+
+            val report = PackAuditor().audit(input)
+
+            assertTrue(report.warnings.any { it.contains("pack_icon.png is 3x2") && it.contains("CPACKICON104") })
+        }
+    }
+
+    @Test
+    fun auditFlagsMissingDuplicateAndUnmeasurableRootPackIcons() {
+        withTempDirectory { root ->
+            val missing = root.resolve("missing-icon.mcpack")
+            writePack(missing, mapOf("manifest.json" to "{}".toByteArray()))
+            assertTrue(PackAuditor().audit(missing).warnings.any { it.contains("CPACKICON101") })
+
+            val malformed = root.resolve("malformed-icon.mcpack")
+            writePack(malformed, mapOf("manifest.json" to "{}".toByteArray(), "pack_icon.png" to byteArrayOf(1, 2, 3)))
+            assertTrue(PackAuditor().audit(malformed).warnings.any { it.contains("could not be validated as a PNG") })
+
+            val duplicate = root.resolve("duplicate-icon.mcpack")
+            val icon = ByteArrayOutputStream().also {
+                ImageIO.write(BufferedImage(2, 2, BufferedImage.TYPE_INT_ARGB), "png", it)
+            }.toByteArray()
+            ZipOutputStream(Files.newOutputStream(duplicate)).use { zip ->
+                zip.putNextEntry(ZipEntry("manifest.json"))
+                zip.write("{}".toByteArray())
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("pack_icon.png"))
+                zip.write(icon)
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("PACK_ICON.PNG"))
+                zip.write(icon)
+                zip.closeEntry()
+            }
+            assertTrue(PackAuditor().audit(duplicate).warnings.any { it.contains("CPACKICON102") })
+        }
+    }
+
+    @Test
+    fun fixedPackTextureReferenceScanFailsClosedOnUnparseableReferences() {
+        withTempDirectory { root ->
+            val input = root.resolve("fixed-pack.mcpack")
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "attachables/external.json" to """{"textures":{"default":"textures/model/shared","enchanted":"textures/misc/glint.png#v"}}""".toByteArray(),
+                "textures/terrain_texture.json" to """{"texture_data":{"block":{"textures":"textures/blocks/stone"}}}""".toByteArray(),
+            ))
+
+            assertEquals(
+                setOf("textures/model/shared.png", "textures/misc/glint.png", "textures/blocks/stone.png"),
+                PackAuditor().texturePathReferences(input),
+            )
+
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "materials/broken.material" to "{\"texture\":\"textures/model/shared\" trailing}".toByteArray(),
+            ))
+            assertNull(PackAuditor().texturePathReferences(input))
+        }
+    }
+
+    @Test
+    fun opaqueBedrockArchivesMakeMetricsIncompleteAndProfilesPassThrough() {
+        withTempDirectory { root ->
+            val input = root.resolve("archived.mcpack")
+            val output = root.resolve("safe.mcpack")
+            val image = BufferedImage(512, 512, BufferedImage.TYPE_INT_ARGB)
+            val png = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "entity/mob.json" to """{"textures":{"default":"textures/entity/mob"}}""".toByteArray(),
+                "textures/entity/mob.png" to png,
+                "__brarchive/textures.brarchive" to byteArrayOf(0x42, 0x52, 0x41, 0x52),
+            ))
+
+            val audit = PackAuditor().audit(input)
+            val rewrite = PackOptimizer().optimizeMini(input, output, emptyList(), 128)
+
+            assertTrue(audit.opaqueBedrockArchivePresent)
+            assertFalse(audit.textureMetricsComplete)
+            assertFalse(audit.atlasReferenceScanComplete)
+            assertFalse(audit.textureHandleScanComplete)
+            assertTrue(audit.warnings.any { it.contains("__brarchive data is opaque") })
+            assertContentEquals(Files.readAllBytes(input), Files.readAllBytes(output))
+            assertEquals(0, rewrite.pngEntriesOptimized)
+            assertEquals(0, rewrite.entriesFiltered)
+        }
+    }
+
+    @Test
+    fun opaqueBedrockArchivePassThroughStillRejectsUnsafeEntries() {
+        withTempDirectory { root ->
+            val input = root.resolve("unsafe.mcpack")
+            val output = root.resolve("output.mcpack")
+            writePack(input, mapOf(
+                "__brarchive/textures.brarchive" to byteArrayOf(0x42, 0x52, 0x41, 0x52),
+                "../outside.txt" to byteArrayOf(1),
+            ))
+
+            assertFailsWith<IllegalArgumentException> {
+                PackOptimizer().optimizeMini(input, output, emptyList(), 128)
+            }
+            assertFalse(Files.exists(output))
+        }
+    }
+
+    @Test
+    fun fileCountWarningsUsePackGuidanceInsteadOfAddonOnlyLimit() {
+        withTempDirectory { root ->
+            fun auditFileCount(count: Int): PackAuditReport {
+                val input = root.resolve("$count.mcpack")
+                val entries = (0 until count).associate { "files/$it.bin" to byteArrayOf(0) }
+                writePack(input, entries)
+                return PackAuditor().audit(input)
+            }
+
+            val saferRange = auditFileCount(PackAuditReport.MOJANG_SAFER_PACK_FILE_COUNT + 1)
+            val highCount = auditFileCount(PackAuditReport.MOJANG_HIGH_PACK_FILE_COUNT + 1)
+
+            assertTrue(saferRange.warnings.any { it.contains("5,000–7,000 safer file-count range") })
+            assertTrue(saferRange.warnings.none { it.contains("run out of memory") })
+            assertTrue(highCount.warnings.any { it.contains("run out of memory on some devices") })
+        }
+    }
+
+    @Test
+    fun auditSeparatesItemAndBlockAtlasMemoryAndRoundsLikeCreatorTools() {
+        withTempDirectory { root ->
+            val input = root.resolve("input.mcpack")
+            fun png(width: Int, height: Int): ByteArray {
+                val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+                return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            }
+            writePack(input, mapOf(
+                "textures/item_texture.json" to """{"texture_data":{"a":{"textures":"textures/items/a"},"b":{"textures":"textures/items/b"}}}""".toByteArray(),
+                "textures/terrain_texture.json" to """{"texture_data":{"block":{"textures":"textures/blocks/a"}}}""".toByteArray(),
+                "attachables/item.json" to """{"textures":{"default":"textures/items/a"}}""".toByteArray(),
+                "textures/items/a.png" to png(16, 16),
+                "textures/items/b.png" to png(32, 16),
+                "textures/blocks/a.png" to png(8, 8),
+            ))
+
+            val report = PackAuditor().audit(input)
+
+            assertTrue(report.atlasReferenceScanComplete)
+            assertEquals((16L * 16L + 32L * 16L) * 4L, report.itemAtlasTextureMemoryBytes)
+            assertEquals(8L * 8L * 4L, report.blockAtlasTextureMemoryBytes)
+            assertEquals(4096L, PackAuditReport.roundedAtlasAllocationBytes(report.itemAtlasTextureMemoryBytes))
+            assertEquals(256L, PackAuditReport.roundedAtlasAllocationBytes(report.blockAtlasTextureMemoryBytes))
+            assertEquals(64L * 1024L * 1024L,
+                PackAuditReport.roundedAtlasAllocationBytes(64L * 1024L * 1024L))
+            assertEquals(128L * 1024L * 1024L,
+                PackAuditReport.roundedAtlasAllocationBytes(64L * 1024L * 1024L + 1))
         }
     }
 
@@ -2185,6 +2644,22 @@ class PackOptimizerTest {
     }
 
     @Test
+    fun auditReportsModelFilesSkippedByTheComplexityScanBound() {
+        withTempDirectory { root ->
+            val input = root.resolve("input.mcpack")
+            val oversizedModel = ("{\"padding\":\"" + "x".repeat(4 * 1024 * 1024) + "\"}")
+                .toByteArray()
+            writePack(input, mapOf("models/entity/oversized.geo.json" to oversizedModel))
+
+            val report = PackAuditor().audit(input)
+
+            assertEquals(1, report.modelFileCount)
+            assertEquals(1, report.oversizedModelCount)
+            assertTrue(report.warnings.any { it.contains("model files exceeded the bounded complexity scan") })
+        }
+    }
+
+    @Test
     fun countsCubesAcrossBlockBonesAndScopesTheGuidanceWarning() {
         withTempDirectory { root ->
             val input = root.resolve("input.mcpack")
@@ -2200,6 +2675,7 @@ class PackOptimizerTest {
 
             assertEquals(60, report.maxModelCubes)
             assertEquals("models/entity/mob.geo.json", report.largestModelPath)
+            assertEquals(1, report.warnings.count { it.contains("50 cubes") })
             assertTrue(report.warnings.any {
                 it.contains("1 block model file exceeds 50 cubes (block maximum 55)")
             })
@@ -2274,12 +2750,13 @@ class PackOptimizerTest {
         withTempDirectory { root ->
             val input = root.resolve("input.mcpack")
             val output = root.resolve("output.mcpack")
-            val atlas = BufferedImage(1024, 1024, BufferedImage.TYPE_INT_ARGB)
+            val atlas = BufferedImage(4096, 4096, BufferedImage.TYPE_INT_ARGB)
+            val sourceCellSize = atlas.width / 16
             val glyphs = listOf(7 to (1 to 1), 8 to (23 to 17), 9 to (49 to 49))
             for ((cell, offset) in glyphs) {
                 val (offsetX, offsetY) = offset
                 for (y in offsetY until offsetY + 4) for (x in offsetX until offsetX + 4) {
-                    atlas.setRGB((cell % 16) * 64 + x, (cell / 16) * 64 + y, Color.WHITE.rgb)
+                    atlas.setRGB((cell % 16) * sourceCellSize + x, (cell / 16) * sourceCellSize + y, Color.WHITE.rgb)
                 }
             }
             val png = ByteArrayOutputStream().also { ImageIO.write(atlas, "png", it) }.toByteArray()
@@ -2294,10 +2771,11 @@ class PackOptimizerTest {
                 val resized = ImageIO.read(zip.getInputStream(zip.getEntry("font/glyph_E3.png")))
                 assertEquals(256, resized.width)
                 assertEquals(256, resized.height)
+                val outputCellSize = resized.width / 16
                 for ((cell, _) in glyphs) {
                     var visiblePixels = 0
-                    for (y in (cell / 16) * 16 until (cell / 16 + 1) * 16) {
-                        for (x in (cell % 16) * 16 until (cell % 16 + 1) * 16) {
+                    for (y in (cell / 16) * outputCellSize until (cell / 16 + 1) * outputCellSize) {
+                        for (x in (cell % 16) * outputCellSize until (cell % 16 + 1) * outputCellSize) {
                             if ((resized.getRGB(x, y) ushr 24) != 0) visiblePixels++
                         }
                     }
@@ -2525,6 +3003,9 @@ class PackOptimizerTest {
 
             assertFalse(report.textureMetricsComplete)
             assertEquals(2, report.unmeasuredTextureCount)
+            assertTrue(report.warnings.any {
+                it.contains("textures/bad.png") && it.contains("textures/oversized.png")
+            })
         }
     }
 

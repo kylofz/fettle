@@ -17,6 +17,7 @@ import java.security.MessageDigest
 import java.util.HashSet
 import java.util.HexFormat
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.Executors
@@ -89,6 +90,8 @@ public class PackOptimizer {
         val removed: Set<String> = emptySet(),
         val jsonStringRewrites: Map<String, String> = emptyMap(),
     )
+
+    private data class JsonRange(val start: Int, val endExclusive: Int)
 
     private data class UvAnimationScan(
         val textureAliasesByController: Map<String, Set<String>?>,
@@ -202,8 +205,58 @@ public class PackOptimizer {
         inputs: List<Path>,
         outputs: List<Path>,
         maxTextureDimension: Int = 0,
+    ): List<PackOptimizationReport> = optimizeForLowEndSet(
+        inputs, outputs, maxTextureDimension, linkedPackGroups(inputs), emptySet()
+    )
+
+    public fun optimizeForLowEndSet(
+        inputs: List<Path>,
+        outputs: List<Path>,
+        maxTextureDimension: Int,
+        linkedPackGroups: List<Set<Int>>,
+    ): List<PackOptimizationReport> = optimizeForLowEndSet(
+        inputs, outputs, maxTextureDimension, linkedPackGroups, emptySet()
+    )
+
+    public fun optimizeForLowEndSet(
+        inputs: List<Path>,
+        outputs: List<Path>,
+        maxTextureDimension: Int,
+        linkedPackGroups: List<Set<Int>>,
+        protectedTexturePaths: Set<String>?,
+    ): List<PackOptimizationReport> = optimizeForLowEndSet(
+        inputs, outputs, maxTextureDimension, linkedPackGroups, protectedTexturePaths,
+        allowCrossPackTextureDedup = protectedTexturePaths != null,
+    )
+
+    public fun optimizeForLowEndSet(
+        inputs: List<Path>,
+        outputs: List<Path>,
+        maxTextureDimension: Int,
+        linkedPackGroups: List<Set<Int>>,
+        protectedTexturePaths: Set<String>?,
+        allowCrossPackTextureDedup: Boolean,
     ): List<PackOptimizationReport> = rewritePackSet(
-        inputs, outputs, maxTextureDimension, cropToUvExtent = true, pruneUnusedAssets = true
+        inputs, outputs, maxTextureDimension, cropToUvExtent = true, pruneUnusedAssets = true,
+        linkedPackGroups = linkedPackGroups,
+        protectedTexturePaths = protectedTexturePaths,
+        allowCrossPackTextureDedup = allowCrossPackTextureDedup,
+    )
+
+    public fun optimizeForLowEndSet(
+        inputs: List<Path>,
+        outputs: List<Path>,
+        maxTextureDimension: Int,
+        linkedPackGroups: List<Set<Int>>,
+        protectedTexturePaths: Set<String>?,
+        allowCrossPackTextureDedup: Boolean,
+        replacementHeaderUuids: List<UUID>,
+    ): List<PackOptimizationReport> = rewritePackSet(
+        inputs, outputs, maxTextureDimension, cropToUvExtent = true, pruneUnusedAssets = true,
+        linkedPackGroups = linkedPackGroups,
+        protectedTexturePaths = protectedTexturePaths,
+        allowCrossPackTextureDedup = allowCrossPackTextureDedup,
+        manifestHeaderUuids = replacementHeaderUuids,
     )
 
     /** Resizes a previously lossless pack set without repeating geometry cropping or pruning. */
@@ -215,36 +268,60 @@ public class PackOptimizer {
         inputs, outputs, maxTextureDimension, cropToUvExtent = false, pruneUnusedAssets = false
     )
 
+    public fun optimizeResizedPackSet(
+        inputs: List<Path>,
+        outputs: List<Path>,
+        maxTextureDimension: Int,
+        replacementHeaderUuids: List<UUID>,
+    ): List<PackOptimizationReport> = rewritePackSet(
+        inputs, outputs, maxTextureDimension, cropToUvExtent = false, pruneUnusedAssets = false,
+        manifestHeaderUuids = replacementHeaderUuids,
+    )
+
     private fun rewritePackSet(
         inputs: List<Path>,
         outputs: List<Path>,
         maxTextureDimension: Int,
         cropToUvExtent: Boolean,
         pruneUnusedAssets: Boolean,
+        linkedPackGroups: List<Set<Int>> = emptyList(),
+        protectedTexturePaths: Set<String>? = emptySet(),
+        allowCrossPackTextureDedup: Boolean = protectedTexturePaths != null,
+        manifestHeaderUuids: List<UUID>? = null,
     ): List<PackOptimizationReport> {
         require(inputs.isNotEmpty()) { "At least one input pack is required" }
         require(inputs.size == outputs.size) { "Each input pack needs one output path" }
         require(maxTextureDimension >= 0) { "Maximum texture dimension cannot be negative" }
+        require(manifestHeaderUuids == null || manifestHeaderUuids.size == inputs.size) {
+            "Each input pack needs one replacement manifest UUID"
+        }
         if (inputs.size == 1) {
             val input = inputs.single()
             val output = outputs.single()
-            if (pruneUnusedAssets) return listOf(
-                if (maxTextureDimension == 0) optimizeForLowEnd(input, output)
-                else optimizeMini(input, output, emptyList(), maxTextureDimension)
-            )
-            val plan = findPackSetCropPlans(inputs, maxTextureDimension, cropToUvExtent).single()
-            return listOf(optimizeInternal(input, output, emptyList(), null, optimizePng = true,
-                    maxTextureDimension = maxTextureDimension, pruneUnusedAssets = false,
-                    extraPlan = plan, onlyResizeAboveLimit = true))
+            if (pruneUnusedAssets && maxTextureDimension > 0 && manifestHeaderUuids == null) {
+                return listOf(optimizeMini(input, output, emptyList(), maxTextureDimension))
+            }
+            val plan = findPackSetCropPlans(
+                inputs, maxTextureDimension, cropToUvExtent, linkedPackGroups, protectedTexturePaths,
+                allowCrossPackTextureDedup,
+            ).single()
+            return listOf(optimizeInternal(input, output, emptyList(), null, optimizePng = maxTextureDimension > 0,
+                    maxTextureDimension = maxTextureDimension, pruneUnusedAssets = pruneUnusedAssets,
+                    extraPlan = plan, onlyResizeAboveLimit = maxTextureDimension > 0,
+                    manifestHeaderUuid = manifestHeaderUuids?.single()))
         }
 
-        val setPlans = findPackSetCropPlans(inputs, maxTextureDimension, cropToUvExtent)
+        val setPlans = findPackSetCropPlans(
+            inputs, maxTextureDimension, cropToUvExtent, linkedPackGroups, protectedTexturePaths,
+            allowCrossPackTextureDedup,
+        )
         val rewrites = inputs.indices.map { index -> {
             optimizeInternal(
                 inputs[index], outputs[index], emptyList(), null, optimizePng = maxTextureDimension > 0,
                 maxTextureDimension = maxTextureDimension,
                 pruneUnusedAssets = pruneUnusedAssets, extraPlan = setPlans[index],
-                onlyResizeAboveLimit = maxTextureDimension > 0
+                onlyResizeAboveLimit = maxTextureDimension > 0,
+                manifestHeaderUuid = manifestHeaderUuids?.get(index),
             )
         } }
         val runtime = Runtime.getRuntime()
@@ -432,6 +509,7 @@ public class PackOptimizer {
         pruneUnusedAssets: Boolean,
         extraPlan: OptimizationPlan? = null,
         onlyResizeAboveLimit: Boolean = false,
+        manifestHeaderUuid: UUID? = null,
     ): PackOptimizationReport {
         require(Files.isRegularFile(input)) { "Input pack does not exist: $input" }
 
@@ -439,12 +517,24 @@ public class PackOptimizer {
         val parent = output.toAbsolutePath().parent
             ?: throw IllegalArgumentException("Output must have a parent directory: $output")
         Files.createDirectories(parent)
+        val opaqueArchiveFileCount = opaqueBedrockArchiveFileCount(input)
+        if (opaqueArchiveFileCount != null) {
+            // shortcut: compiled Bedrock archives are opaque; pass them through instead of changing only loose sidecars.
+            validateOpaqueArchiveInput(input)
+            if (input.toAbsolutePath().normalize() != output.toAbsolutePath().normalize()) {
+                Files.copy(input, output, StandardCopyOption.REPLACE_EXISTING)
+            }
+            return PackOptimizationReport(
+                inputBytes, Files.size(output), opaqueArchiveFileCount, opaqueArchiveFileCount, 0, 0, 0, 0
+            )
+        }
 
         val patterns = keepPatterns.asSequence()
             .map { it.trim().lowercase(Locale.ROOT) }
             .filter { it.isNotEmpty() }
             .toList()
-        val overrideManifest = manifestJson?.toByteArray(StandardCharsets.UTF_8)
+        val manifestOverride = manifestJson ?: manifestHeaderUuid?.let { rewriteManifestHeaderUuid(input, it) }
+        val overrideManifest = manifestOverride?.toByteArray(StandardCharsets.UTF_8)
             ?.let(JsonMinifier::minifyIfSmaller)
         val animatedTextures = findAnimatedTextures(input)
         val localPlan = if (pruneUnusedAssets && patterns.isEmpty()) {
@@ -590,7 +680,7 @@ public class PackOptimizer {
                                 if (!optimized.contentEquals(original)) {
                                     if (isPng) pngEntriesOptimized++ else otherRasterEntriesResized++
                                 }
-                                if (isPng) zipOut.addStored(name, optimized)
+                                if (isPng) zipOut.add(name, ByteArrayInputStream(optimized))
                                 else addEntry(name, ByteArrayInputStream(optimized))
                             }
                         } else {
@@ -602,7 +692,7 @@ public class PackOptimizer {
                     for ((name, bytes) in plan.generatedEntries) {
                         val validated = validateEntryName(name)
                         if (!outputNames.add(validated)) throw IOException("Duplicate generated ZIP entry: $validated")
-                        zipOut.addStored(validated, bytes)
+                        zipOut.add(validated, ByteArrayInputStream(bytes))
                         entriesWritten++
                     }
                     zipOut.finish()
@@ -625,6 +715,24 @@ public class PackOptimizer {
             pngEntriesOptimized = pngEntriesOptimized,
             otherRasterEntriesResized = otherRasterEntriesResized,
         )
+    }
+
+    private fun validateOpaqueArchiveInput(input: Path) {
+        val names = HashSet<String>()
+        var entriesSeen = 0
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        BoundedZipInputStream(Files.newInputStream(input)).use { zipIn ->
+            while (true) {
+                val entry = zipIn.nextEntry ?: break
+                if (++entriesSeen > MAX_ZIP_ENTRIES) throw IOException("Pack has more than $MAX_ZIP_ENTRIES ZIP entries")
+                if (!entry.isDirectory) {
+                    val name = validateEntryName(entry.name)
+                    if (!names.add(name)) throw IOException("Duplicate ZIP entry: $name")
+                    drain(zipIn, buffer)
+                }
+                zipIn.closeEntry()
+            }
+        }
     }
 
     /** Plans only JSON-proven dead assets and unambiguous static cube-UV crops. */
@@ -962,6 +1070,9 @@ public class PackOptimizer {
         inputs: List<Path>,
         maxTextureDimension: Int,
         cropToUvExtent: Boolean,
+        linkedPackGroups: List<Set<Int>> = emptyList(),
+        protectedTexturePaths: Set<String>? = emptySet(),
+        allowCrossPackTextureDedup: Boolean = protectedTexturePaths != null,
     ): List<OptimizationPlan> {
         fun emptyPlans() = List(inputs.size) {
             OptimizationPlan(
@@ -971,6 +1082,17 @@ public class PackOptimizer {
             )
         }
         if (inputs.size !in 1..MAX_PACK_SET_FILES) return emptyPlans()
+        val allowCrossPackTextureDedup = allowCrossPackTextureDedup && protectedTexturePaths != null
+        val protectedPaths = protectedTexturePaths.orEmpty().mapTo(HashSet()) { it.lowercase(Locale.ROOT) }
+        val linkedGroupByPack = HashMap<Int, Int>()
+        linkedPackGroups.forEachIndexed { groupIndex, group ->
+            for (packIndex in group) {
+                require(packIndex in inputs.indices) { "Linked pack index is outside the input set: $packIndex" }
+                require(linkedGroupByPack.put(packIndex, groupIndex) == null) {
+                    "A pack cannot belong to multiple linked profile groups: $packIndex"
+                }
+            }
+        }
 
         val zips = ArrayList<ZipFile>(inputs.size)
         try {
@@ -1351,7 +1473,9 @@ public class PackOptimizer {
                         val entry = zips[key.packIndex].getEntry(key.path) ?: return@mapNotNull null
                         val source = zips[key.packIndex].getInputStream(entry)
                             .use { readBounded(it, MAX_PNG_BYTES) } ?: return@mapNotNull null
-                        PngOptimizer.cropRegion(source, crop)?.let(::textureFingerprint)
+                        PngOptimizer.decodedCropPixelHash(source, crop)?.let {
+                            "pixels:${HexFormat.of().formatHex(it)}"
+                        } ?: PngOptimizer.cropRegion(source, crop)?.let(::textureFingerprint)
                     }
                     if (hashes.size == keys.size) {
                         val variantHashes = hashes.distinct().sorted()
@@ -1385,7 +1509,7 @@ public class PackOptimizer {
             val atlasRemovedEntries = List(inputs.size) { HashSet<String>() }
             val atlasRewrites = List(inputs.size) { HashMap<String, String>() }
             val generatedEntries = List(inputs.size) { HashMap<String, ByteArray>() }
-            val atlasedTextures = if (maxTextureDimension == 0 && cropToUvExtent) {
+            val atlasedTextures = if (maxTextureDimension == 0 && cropToUvExtent && protectedTexturePaths != null) {
                 buildLosslessAtlases(
                     atlasCandidates,
                     zips,
@@ -1400,6 +1524,7 @@ public class PackOptimizer {
                     generatedEntries,
                     protectedEntries,
                     unsafeGeometryFiles,
+                    protectedPaths,
                 )
             } else emptySet()
             val croppedDedup = if (cropToUvExtent && maxTextureDimension == 0) {
@@ -1407,11 +1532,15 @@ public class PackOptimizer {
                     zips,
                     textureCrops,
                     textureEntrySizes,
+                    entryNamesByPack,
                     textureKeysByPath,
                     textureReferences,
                     textureMapUsesByTexture,
                     ambiguousTexturePaths,
                     animatedTextures,
+                    linkedGroupByPack,
+                    protectedPaths,
+                    allowCrossPackTextureDedup,
                     protectedEntries,
                     atlasedTextures,
                 )
@@ -1464,8 +1593,28 @@ public class PackOptimizer {
         PngOptimizer.decodedPixelHash(bytes)?.let { "pixels:${HexFormat.of().formatHex(it)}" }
             ?: "bytes:${HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))}"
 
+    private fun textureFingerprint(bytes: ByteArray, crop: TextureCrop?): String? =
+        if (crop == null) textureFingerprint(bytes)
+        else PngOptimizer.decodedCropPixelHash(bytes, crop)?.let { "pixels:${HexFormat.of().formatHex(it)}" }
+
     private fun sameTextureContent(first: ByteArray, second: ByteArray): Boolean =
         first.contentEquals(second) || PngOptimizer.sameDecodedPixels(first, second)
+
+    private fun sameTextureContent(
+        first: ByteArray,
+        firstCrop: TextureCrop?,
+        second: ByteArray,
+        secondCrop: TextureCrop?,
+    ): Boolean {
+        if (firstCrop != null && secondCrop != null) {
+            val firstImage = PngOptimizer.cropImage(first, firstCrop) ?: return false
+            val secondImage = PngOptimizer.cropImage(second, secondCrop) ?: return false
+            return PngOptimizer.samePixels(firstImage, secondImage)
+        }
+        val firstOutput = if (firstCrop == null) first else PngOptimizer.cropRegion(first, firstCrop) ?: return false
+        val secondOutput = if (secondCrop == null) second else PngOptimizer.cropRegion(second, secondCrop) ?: return false
+        return sameTextureContent(firstOutput, secondOutput)
+    }
 
     private fun buildLosslessAtlases(
         candidates: List<AtlasComponent>,
@@ -1481,6 +1630,7 @@ public class PackOptimizer {
         generatedEntries: List<MutableMap<String, ByteArray>>,
         protectedEntries: List<MutableSet<String>>,
         unsafeGeometryFiles: List<MutableSet<String>>,
+        protectedTexturePaths: Set<String>,
     ): Set<PackEntryKey> {
         val atlased = HashSet<PackEntryKey>()
         val atlasPaths = HashMap<PackEntryKey, String>()
@@ -1528,7 +1678,7 @@ public class PackOptimizer {
                     }
                     paths.takeUnless { candidate -> candidate.any { path ->
                         val normalized = path.lowercase(Locale.ROOT)
-                        entryNamesByPack.any { normalized in it }
+                        normalized in protectedTexturePaths || entryNamesByPack.any { normalized in it }
                     } }
                 }.firstOrNull() ?: throw IOException("Could not find an unused generated texture atlas path")
 
@@ -1548,7 +1698,7 @@ public class PackOptimizer {
                         val source = zips[texture.packIndex].getInputStream(entry)
                             .use { readBounded(it, MAX_PNG_BYTES) }
                             ?: throw IOException("Atlas source texture exceeded the bounded read size: ${texture.path}")
-                        val cropped = PngOptimizer.cropRegion(source, component.crop)
+                        val cropped = PngOptimizer.cropImage(source, component.crop)
                             ?: throw IOException("Texture could not be safely cropped for an atlas: ${texture.path}")
                         val contentX = placement.x + ATLAS_GUTTER
                         val contentY = placement.y + ATLAS_GUTTER
@@ -1615,22 +1765,35 @@ public class PackOptimizer {
         zips: List<ZipFile>,
         crops: List<Map<String, TextureCrop>>,
         sizes: Map<PackEntryKey, Long>,
+        entryNamesByPack: List<Set<String>>,
         entriesByPath: Map<String, List<PackEntryKey>>,
         references: Map<PackEntryKey, List<PackSetTextureReference>>,
         textureMapUses: Map<PackEntryKey, List<PackSetTextureUse>>,
         ambiguousPaths: Set<String>,
         animatedTextures: Set<PackEntryKey>,
+        linkedGroupByPack: Map<Int, Int>,
+        protectedPaths: Set<String>,
+        allowCrossPackTextureDedup: Boolean,
         protectedEntries: List<MutableSet<String>>,
         excluded: Set<PackEntryKey>,
     ): PackSetTextureDedupPlan {
-        val pathsByHash = HashMap<Pair<Int, String>, MutableList<PackEntryKey>>()
+        val pathsByHash = HashMap<String, MutableList<PackEntryKey>>()
         for ((texture, uses) in textureMapUses) {
             if (texture in excluded) continue
             val crop = crops.getOrNull(texture.packIndex)?.get(texture.path)
             val refs = references[texture].orEmpty()
             val size = sizes[texture] ?: continue
+            val extension = texture.path.lastIndexOf('.')
+            if (extension <= texture.path.lastIndexOf('/')) continue
+            val stem = texture.path.substring(0, extension).lowercase(Locale.ROOT)
             if (texture.path.startsWith(JAVA_RENDERED_ITEM_PATH, ignoreCase = true) ||
                 texture.path in ambiguousPaths || entriesByPath[texture.path].orEmpty().size != 1 ||
+                texture.path.lowercase(Locale.ROOT) in protectedPaths ||
+                listOf("$stem.tga", "$stem.jpg", "$stem.jpeg").any { it in protectedPaths } ||
+                "${stem}.texture_set.json" in entryNamesByPack[texture.packIndex] ||
+                entryNamesByPack.any { names ->
+                    listOf("$stem.tga", "$stem.jpg", "$stem.jpeg").any(names::contains)
+                } ||
                 texture in animatedTextures ||
                 uses.isEmpty() ||
                 refs.size != uses.size ||
@@ -1646,36 +1809,30 @@ public class PackOptimizer {
             val source = zips[texture.packIndex].getInputStream(entry).use { readBounded(it, MAX_PNG_BYTES) }
                 ?: continue
             if (crop == null && PngOptimizer.dimensions(source) == null) continue
-            val output = if (crop == null) source else PngOptimizer.cropRegion(source, crop) ?: continue
-            val hash = textureFingerprint(output)
-            pathsByHash.getOrPut(texture.packIndex to hash, ::ArrayList).add(texture)
+            val hash = textureFingerprint(source, crop) ?: continue
+            pathsByHash.getOrPut(hash, ::ArrayList).add(texture)
         }
 
         val removed = List(zips.size) { HashSet<String>() }
         val rewrites = List(zips.size) { HashMap<String, String>() }
-        for (paths in pathsByHash.values) {
-            val distinct = paths.distinct().sortedBy { it.path }
-            if (distinct.size < 2) continue
+        fun removeDuplicates(paths: List<PackEntryKey>) {
+            val distinct = paths.distinct().sortedWith(compareBy({ it.packIndex }, { it.path }))
+            if (distinct.size < 2) return
             val canonical = distinct.first()
-            val canonicalEntry = zips[canonical.packIndex].getEntry(canonical.path) ?: continue
+            val canonicalEntry = zips[canonical.packIndex].getEntry(canonical.path) ?: return
             val canonicalBytes = zips[canonical.packIndex].getInputStream(canonicalEntry)
-                .use { readBounded(it, MAX_PNG_BYTES) } ?: continue
+                .use { readBounded(it, MAX_PNG_BYTES) } ?: return
             val canonicalCrop = crops[canonical.packIndex][canonical.path]
-            val canonicalOutput = if (canonicalCrop == null) canonicalBytes
-                else PngOptimizer.cropRegion(canonicalBytes, canonicalCrop) ?: continue
             for (duplicate in distinct.drop(1)) {
                 val duplicateEntry = zips[duplicate.packIndex].getEntry(duplicate.path) ?: continue
                 val duplicateBytes = zips[duplicate.packIndex].getInputStream(duplicateEntry)
                     .use { readBounded(it, MAX_PNG_BYTES) } ?: continue
                 val duplicateCrop = crops[duplicate.packIndex][duplicate.path]
-                val duplicateOutput = if (duplicateCrop == null) duplicateBytes
-                    else PngOptimizer.cropRegion(duplicateBytes, duplicateCrop) ?: continue
-                if (!sameTextureContent(canonicalOutput, duplicateOutput)) continue
-                val duplicateUses = references.getValue(duplicate)
+                if (!sameTextureContent(canonicalBytes, canonicalCrop, duplicateBytes, duplicateCrop)) continue
                 val replacements = HashMap<String, String>()
-                for (use in duplicateUses) {
-                    val rewrite = rewriteTextureValue(use.value, canonical.path)
-                    val previous = replacements.putIfAbsent(use.value, rewrite)
+                for (reference in references.getValue(duplicate)) {
+                    val rewrite = rewriteTextureValue(reference.value, canonical.path)
+                    val previous = replacements.putIfAbsent(reference.value, rewrite)
                     if (previous != null && previous != rewrite) {
                         replacements.clear()
                         break
@@ -1685,6 +1842,18 @@ public class PackOptimizer {
                 removed[duplicate.packIndex].add(duplicate.path)
                 rewrites[duplicate.packIndex].putAll(replacements)
                 protectedEntries[duplicate.packIndex].remove(duplicate.path)
+            }
+        }
+        for (paths in pathsByHash.values) {
+            val distinct = paths.distinct()
+            distinct.groupBy { it.packIndex }.values.forEach(::removeDuplicates)
+            if (allowCrossPackTextureDedup) {
+                distinct.filterNot { it.path in removed[it.packIndex] }
+                    .mapNotNull { texture -> linkedGroupByPack[texture.packIndex]?.let { it to texture } }
+                    .groupBy({ it.first }, { it.second })
+                    .values
+                    .filter { linked -> linked.map { it.packIndex }.distinct().size > 1 }
+                    .forEach(::removeDuplicates)
             }
         }
         return PackSetTextureDedupPlan(removed, rewrites)
@@ -1936,6 +2105,105 @@ public class PackOptimizer {
         return null
     }
 
+    private fun rewriteManifestHeaderUuid(input: Path, replacement: UUID): String {
+        val manifestBytes = ZipFile(input.toFile()).use { zip ->
+            val entries = zip.entries()
+            var manifest: ZipEntry? = null
+            var count = 0
+            var scanned = 0
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (++scanned > MAX_ZIP_ENTRIES) throw IOException("Pack has more than $MAX_ZIP_ENTRIES ZIP entries")
+                if (entry.name == "manifest.json") {
+                    manifest = entry
+                    count++
+                }
+            }
+            if (count != 1) throw IOException("Pack must contain exactly one manifest.json")
+            val entry = manifest ?: throw IOException("Pack has no manifest.json")
+            if (entry.size > MAX_JSON_BYTES) throw IOException("Pack manifest exceeds the bounded transform size")
+            zip.getInputStream(entry).use { readBounded(it, MAX_JSON_BYTES) }
+                ?: throw IOException("Pack manifest exceeds the bounded transform size")
+        }
+        val text = decodeUtf8(manifestBytes) ?: throw IOException("Pack manifest is not valid UTF-8")
+        if (JsonStringScanner.read(text) == null) throw IOException("Pack manifest is not valid JSON")
+        val root = skipJsonWhitespace(text, 0)
+        if (text.getOrNull(root) != '{') throw IOException("Pack manifest root is not an object")
+        val header = jsonObjectPropertyRange(text, root, "header")
+            ?: throw IOException("Pack manifest must contain exactly one root header object")
+        if (text[header.start] != '{') throw IOException("Pack manifest header is not an object")
+        val headerOpen = header.start
+        val uuid = jsonObjectPropertyRange(text, headerOpen, "uuid")
+            ?: throw IOException("Pack manifest header must contain exactly one UUID")
+        if (text[uuid.start] != '"' || uuid.endExclusive - uuid.start < 2) {
+            throw IOException("Pack manifest header UUID is not a string")
+        }
+        val currentUuid = JsonStringScanner.read(text.substring(uuid.start, uuid.endExclusive))?.singleOrNull()
+        try {
+            UUID.fromString(currentUuid ?: throw IllegalArgumentException("missing uuid"))
+        } catch (_: IllegalArgumentException) {
+            throw IOException("Pack manifest header UUID is invalid")
+        }
+        return text.replaceRange(uuid.start + 1, uuid.endExclusive - 1, replacement.toString())
+    }
+
+    private fun jsonObjectPropertyRange(text: String, openBrace: Int, property: String): JsonRange? {
+        if (text.getOrNull(openBrace) != '{') return null
+        var index = skipJsonWhitespace(text, openBrace + 1)
+        var found: JsonRange? = null
+        while (index < text.length && text[index] != '}') {
+            if (text[index] != '"') return null
+            val keyEnd = jsonStringEnd(text, index) ?: return null
+            val key = JsonStringScanner.read(text.substring(index, keyEnd))?.singleOrNull() ?: return null
+            index = skipJsonWhitespace(text, keyEnd)
+            if (text.getOrNull(index) != ':') return null
+            val valueStart = skipJsonWhitespace(text, index + 1)
+            val valueEnd = jsonValueEnd(text, valueStart) ?: return null
+            if (key == property) {
+                if (found != null) return null
+                found = JsonRange(valueStart, valueEnd)
+            }
+            index = skipJsonWhitespace(text, valueEnd)
+            when (text.getOrNull(index)) {
+                ',' -> index = skipJsonWhitespace(text, index + 1)
+                '}' -> return found
+                else -> return null
+            }
+        }
+        return found.takeIf { text.getOrNull(index) == '}' }
+    }
+
+    private fun jsonValueEnd(text: String, start: Int): Int? = when (text.getOrNull(start)) {
+        '"' -> jsonStringEnd(text, start)
+        '{' -> matchingJsonObjectEnd(text, start)?.plus(1)
+        '[' -> matchingJsonArrayEnd(text, start)?.plus(1)
+        null -> null
+        else -> {
+            var end = start
+            while (end < text.length && text[end] !in " \t\r\n,}]") end++
+            end.takeIf { it > start }
+        }
+    }
+
+    private fun jsonStringEnd(text: String, start: Int): Int? {
+        if (text.getOrNull(start) != '"') return null
+        var escaped = false
+        for (index in start + 1 until text.length) {
+            when {
+                escaped -> escaped = false
+                text[index] == '\\' -> escaped = true
+                text[index] == '"' -> return index + 1
+            }
+        }
+        return null
+    }
+
+    private fun skipJsonWhitespace(text: String, start: Int): Int {
+        var index = start
+        while (index < text.length && text[index] in " \t\r\n") index++
+        return index
+    }
+
     private fun jsonStringArrayProperty(text: String, property: String): List<String>? {
         val matches = Regex("\"${Regex.escape(property)}\"\\s*:\\s*\\[").findAll(text).toList()
         if (matches.size != 1) return null
@@ -2099,8 +2367,7 @@ public class PackOptimizer {
             val entry = zip.getEntry(texture) ?: continue
             val source = zip.getInputStream(entry).use { readBounded(it, MAX_PNG_BYTES) } ?: continue
             if (crop == null && PngOptimizer.dimensions(source) == null) continue
-            val output = if (crop == null) source else PngOptimizer.cropRegion(source, crop) ?: continue
-            val hash = textureFingerprint(output)
+            val hash = textureFingerprint(source, crop) ?: continue
             pathsByHash.getOrPut(hash, ::ArrayList).add(texture)
         }
 
@@ -2113,16 +2380,12 @@ public class PackOptimizer {
             val canonicalEntry = zip.getEntry(canonical) ?: continue
             val canonicalBytes = zip.getInputStream(canonicalEntry).use { readBounded(it, MAX_PNG_BYTES) } ?: continue
             val canonicalCrop = crops[canonical]
-            val canonicalOutput = if (canonicalCrop == null) canonicalBytes
-                else PngOptimizer.cropRegion(canonicalBytes, canonicalCrop) ?: continue
             for (duplicate in distinct.drop(1)) {
                 val duplicateEntry = zip.getEntry(duplicate) ?: continue
                 val duplicateBytes = zip.getInputStream(duplicateEntry).use { readBounded(it, MAX_PNG_BYTES) }
                     ?: continue
                 val duplicateCrop = crops[duplicate]
-                val duplicateOutput = if (duplicateCrop == null) duplicateBytes
-                    else PngOptimizer.cropRegion(duplicateBytes, duplicateCrop) ?: continue
-                if (!sameTextureContent(canonicalOutput, duplicateOutput)) continue
+                if (!sameTextureContent(canonicalBytes, canonicalCrop, duplicateBytes, duplicateCrop)) continue
                 val groupRewrites = textureMapUses.getValue(duplicate)
                     .associateWith { rewriteTextureValue(it, canonical) }
                 if (groupRewrites.keys.isEmpty()) continue

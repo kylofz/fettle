@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.HashMap
 import java.util.zip.CRC32
 import javax.imageio.IIOImage
 import javax.imageio.ImageIO
@@ -63,6 +64,23 @@ internal object PngOptimizer {
 
     fun decodedPixelHash(bytes: ByteArray): ByteArray? {
         val image = readPixelImage(bytes) ?: return null
+        return decodedPixelHash(image)
+    }
+
+    fun decodedCropPixelHash(bytes: ByteArray, crop: TextureCrop): ByteArray? {
+        if (!bytes.isPng() || !hasOnlyPixelChunks(bytes)) return null
+        val dimensions = pngDimensions(bytes) ?: return null
+        if (dimensions.width.toLong() * dimensions.height > MAX_PIXELS ||
+            dimensions.width != crop.sourceWidth || dimensions.height != crop.sourceHeight ||
+            crop.x < 0 || crop.y < 0 || crop.width <= 0 || crop.height <= 0 ||
+            crop.x.toLong() + crop.width > dimensions.width || crop.y.toLong() + crop.height > dimensions.height
+        ) return null
+        val image = readPngRegion(bytes, dimensions, crop.x, crop.y, crop.width, crop.height) ?: return null
+        if (image.width != crop.width || image.height != crop.height) return null
+        return decodedPixelHash(image)
+    }
+
+    private fun decodedPixelHash(image: BufferedImage): ByteArray {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update(byteArrayOf(
             (image.width ushr 24).toByte(), (image.width ushr 16).toByte(),
@@ -102,17 +120,20 @@ internal object PngOptimizer {
         return true
     }
 
-    fun cropRegion(bytes: ByteArray, crop: TextureCrop): ByteArray? {
-        if (!bytes.isPng() || !hasOnlyPixelChunks(bytes)) return null
-        val dimensions = pngDimensions(bytes) ?: return null
-        val pixelCount = dimensions.width.toLong() * dimensions.height.toLong()
-        if (pixelCount > MAX_PIXELS || dimensions.width != crop.sourceWidth || dimensions.height != crop.sourceHeight ||
-            crop.x < 0 || crop.y < 0 || crop.width <= 0 || crop.height <= 0 ||
-            crop.x.toLong() + crop.width > dimensions.width || crop.y.toLong() + crop.height > dimensions.height
-        ) return null
-        val source = readPngRegion(bytes, dimensions, crop.x, crop.y, crop.width, crop.height) ?: return null
-        if (source.width != crop.width || source.height != crop.height) return null
+    fun samePixels(first: BufferedImage, second: BufferedImage): Boolean {
+        if (first.width != second.width || first.height != second.height) return false
+        val firstRow = IntArray(first.width)
+        val secondRow = IntArray(first.width)
+        for (y in 0 until first.height) {
+            first.getRGB(0, y, first.width, 1, firstRow, 0, first.width)
+            second.getRGB(0, y, second.width, 1, secondRow, 0, second.width)
+            if (!firstRow.contentEquals(secondRow)) return false
+        }
+        return true
+    }
 
+    fun cropRegion(bytes: ByteArray, crop: TextureCrop): ByteArray? {
+        val source = cropImage(bytes, crop) ?: return null
         val encoded = encode(source) ?: return null
         val decoded = try {
             ImageIO.read(ByteArrayInputStream(encoded)) ?: return null
@@ -128,6 +149,19 @@ internal object PngOptimizer {
             if (!expected.contentEquals(actual)) return null
         }
         return encoded
+    }
+
+    fun cropImage(bytes: ByteArray, crop: TextureCrop): BufferedImage? {
+        if (!bytes.isPng() || !hasOnlyPixelChunks(bytes)) return null
+        val dimensions = pngDimensions(bytes) ?: return null
+        val pixelCount = dimensions.width.toLong() * dimensions.height.toLong()
+        if (pixelCount > MAX_PIXELS || dimensions.width != crop.sourceWidth || dimensions.height != crop.sourceHeight ||
+            crop.x < 0 || crop.y < 0 || crop.width <= 0 || crop.height <= 0 ||
+            crop.x.toLong() + crop.width > dimensions.width || crop.y.toLong() + crop.height > dimensions.height
+        ) return null
+        val source = readPngRegion(bytes, dimensions, crop.x, crop.y, crop.width, crop.height) ?: return null
+        if (source.width != crop.width || source.height != crop.height) return null
+        return source
     }
 
     private fun readPngRegion(
@@ -210,6 +244,25 @@ internal object PngOptimizer {
         val roundTripPixels = IntArray(pixels.size)
         roundTrip.getRGB(0, 0, roundTrip.width, roundTrip.height, roundTripPixels, 0, roundTrip.width)
         return if (pixels.contentEquals(roundTripPixels)) encoded else bytes
+    }
+
+    fun optimizeIfSmaller(image: BufferedImage, originalBytes: ByteArray): ByteArray? {
+        if (image.width.toLong() * image.height > MAX_PIXELS) return null
+        val pixels = IntArray(image.width * image.height)
+        image.getRGB(0, 0, image.width, image.height, pixels, 0, image.width)
+        val optimized = encode(exactCandidate(image, pixels))
+        if (optimized != null && optimized.size < originalBytes.size && decodedPixelsMatch(image, optimized)) {
+            return optimized
+        }
+        return originalBytes.takeIf { decodedPixelsMatch(image, it) }
+    }
+
+    fun encodeLossless(image: BufferedImage): ByteArray? {
+        if (image.width.toLong() * image.height > MAX_PIXELS) return null
+        val pixels = IntArray(image.width * image.height)
+        image.getRGB(0, 0, image.width, image.height, pixels, 0, image.width)
+        val encoded = encode(exactCandidate(image, pixels)) ?: return null
+        return encoded.takeIf { decodedPixelsMatch(image, it) }
     }
 
     private fun pngDimensions(bytes: ByteArray): ImageDimensions? {
@@ -313,12 +366,20 @@ internal object PngOptimizer {
 
     private fun exactCandidate(source: BufferedImage, pixels: IntArray): BufferedImage {
         val colors = LinkedHashSet<Int>()
+        var tooManyColors = false
+        var opaque = true
         for (pixel in pixels) {
-            colors += pixel
-            if (colors.size > 256) break
+            if (pixel ushr 24 != 255) opaque = false
+            if (!tooManyColors) {
+                colors += pixel
+                if (colors.size > 256) {
+                    colors.clear()
+                    tooManyColors = true
+                }
+            }
         }
 
-        if (colors.size <= 256) {
+        if (!tooManyColors) {
             val palette = colors.toIntArray()
             val red = ByteArray(palette.size)
             val green = ByteArray(palette.size)
@@ -333,12 +394,15 @@ internal object PngOptimizer {
             }
 
             val colorModel = IndexColorModel(8, palette.size, red, green, blue, alpha)
-            return BufferedImage(source.width, source.height, BufferedImage.TYPE_BYTE_INDEXED, colorModel).also {
-                it.setRGB(0, 0, source.width, source.height, pixels, 0, source.width)
+            val indices = HashMap<Int, Int>(palette.size)
+            palette.forEachIndexed { index, color -> indices[color] = index }
+            val indexedPixels = ByteArray(pixels.size) { index -> indices.getValue(pixels[index]).toByte() }
+            return BufferedImage(source.width, source.height, BufferedImage.TYPE_BYTE_INDEXED, colorModel).apply {
+                raster.setDataElements(0, 0, source.width, source.height, indexedPixels)
             }
         }
 
-        if (pixels.all { it ushr 24 == 255 }) {
+        if (opaque) {
             return BufferedImage(source.width, source.height, BufferedImage.TYPE_INT_RGB).also {
                 it.setRGB(0, 0, source.width, source.height, pixels, 0, source.width)
             }
@@ -367,6 +431,23 @@ internal object PngOptimizer {
         } finally {
             writer.dispose()
         }
+    }
+
+    private fun decodedPixelsMatch(source: BufferedImage, bytes: ByteArray): Boolean {
+        val decoded = try {
+            ImageIO.read(ByteArrayInputStream(bytes)) ?: return false
+        } catch (_: Exception) {
+            return false
+        }
+        if (decoded.width != source.width || decoded.height != source.height) return false
+        val expected = IntArray(source.width)
+        val actual = IntArray(source.width)
+        for (row in 0 until source.height) {
+            source.getRGB(0, row, source.width, 1, expected, 0, source.width)
+            decoded.getRGB(0, row, decoded.width, 1, actual, 0, decoded.width)
+            if (!expected.contentEquals(actual)) return false
+        }
+        return true
     }
 
     private fun ByteArray.isPng(): Boolean {

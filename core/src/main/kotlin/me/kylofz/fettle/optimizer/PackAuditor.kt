@@ -16,8 +16,70 @@ import java.util.TreeSet
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
+internal fun isOpaqueBedrockArchiveEntry(name: String): Boolean {
+    val normalized = name.replace('\\', '/').lowercase(Locale.ROOT)
+    return normalized.endsWith(".brarchive") &&
+        (normalized.startsWith("__brarchive/") || normalized.contains("/__brarchive/"))
+}
+
+internal fun opaqueBedrockArchiveFileCount(pack: Path): Int? = ZipFile(pack.toFile()).use { zip ->
+    var containsOpaqueArchive = false
+    var fileCount = 0
+    val entries = zip.entries()
+    while (entries.hasMoreElements()) {
+        val entry = entries.nextElement()
+        if (entry.isDirectory) continue
+        fileCount++
+        if (isOpaqueBedrockArchiveEntry(entry.name)) containsOpaqueArchive = true
+    }
+    fileCount.takeIf { containsOpaqueArchive }
+}
+
 /** Estimates raster memory for every PNG/JPEG/TGA in the archive, including font glyphs, without decoding whole images. */
 public class PackAuditor {
+    public fun hasOpaqueBedrockArchive(pack: Path): Boolean = opaqueBedrockArchiveFileCount(pack) != null
+
+    public fun texturePathReferences(pack: Path): Set<String>? {
+        if (!Files.isRegularFile(pack)) return null
+        val paths = HashSet<String>()
+        var scannedBytes = 0L
+        var scannedFiles = 0
+        return try {
+            ZipFile(pack.toFile()).use { zip ->
+                val entries = zip.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    if (entry.isDirectory) continue
+                    val name = entry.name.lowercase(Locale.ROOT)
+                    if (!name.endsWith(".json") && !name.endsWith(".material")) continue
+                    if (++scannedFiles > MAX_TEXTURE_REFERENCE_FILES) return null
+                    val bytes = zip.getInputStream(entry).use { readBounded(it, MAX_ATLAS_REFERENCE_FILE_BYTES) }
+                        ?: return null
+                    if (scannedBytes > MAX_ATLAS_REFERENCE_TOTAL_BYTES - bytes.size) return null
+                    scannedBytes += bytes.size
+                    val text = try {
+                        StandardCharsets.UTF_8.newDecoder()
+                            .onMalformedInput(CodingErrorAction.REPORT)
+                            .onUnmappableCharacter(CodingErrorAction.REPORT)
+                            .decode(ByteBuffer.wrap(bytes))
+                            .toString()
+                    } catch (_: CharacterCodingException) {
+                        return null
+                    }
+                    if (name.endsWith(".material") && !text.contains("textures/", ignoreCase = true)) continue
+                    val strings = JsonStringScanner.read(text) ?: return null
+                    for (value in strings) {
+                        if (!value.contains("textures/", ignoreCase = true)) continue
+                        paths += atlasTexturePath(value) ?: return null
+                    }
+                }
+                paths
+            }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
     public fun audit(pack: Path): PackAuditReport {
         require(Files.isRegularFile(pack)) { "Pack does not exist: $pack" }
 
@@ -26,10 +88,12 @@ public class PackAuditor {
         var estimatedTextureHandleCount = 0
         var textureFileCount = 0
         var textureMemoryBytes = 0L
+        var texturesOverHighestResolutionMipBudget = 0
         var largestTexturePath: String? = null
         var largestTextureWidth = 0
         var largestTextureHeight = 0
         var largestTextureMemoryBytes = 0L
+        val textureHotspots = ArrayList<PackAuditReport.TextureHotspot>(MAX_TEXTURE_HOTSPOTS)
         var largestPotentialAtlasTexturePath: String? = null
         var largestPotentialAtlasTextureMemoryBytes = 0L
         var potentialAtlasTexturesOverBudgetCount = 0
@@ -40,10 +104,17 @@ public class PackAuditor {
         var maxBlockModelCubes = 0
         var blockModelFilesOver50Cubes = 0
         var unmeasuredTextureCount = 0
+        val unmeasuredTextureExamples = ArrayList<String>(3)
         var oversizedModelCount = 0
         var pngAnimationMetadataCount = 0
         var rootFontGlyphCount = 0
-        var textureReferences = TextureReferenceScan(emptySet(), 0, false, false)
+        var rootFontGlyphTextureMemoryBytes = 0L
+        var itemAtlasTextureMemoryBytes = 0L
+        var blockAtlasTextureMemoryBytes = 0L
+        var rootPackIconCount = 0
+        var rootPackIconDimensions: Dimensions? = null
+        var opaqueBedrockArchivePresent = false
+        var textureReferences = TextureReferenceScan(emptySet(), emptySet(), emptySet(), 0, false, false)
 
         ZipFile(pack.toFile()).use { zip ->
             textureReferences = findTextureReferences(zip)
@@ -61,8 +132,11 @@ public class PackAuditor {
                 }
 
                 val lowerName = entry.name.lowercase(Locale.ROOT)
+                if (lowerName == "pack_icon.png") rootPackIconCount++
+                if (isOpaqueBedrockArchiveEntry(entry.name)) opaqueBedrockArchivePresent = true
                 if (lowerName.endsWith(".png.mcmeta")) pngAnimationMetadataCount++
-                if (lowerName.startsWith("font/glyph_") && lowerName.endsWith(".png")) rootFontGlyphCount++
+                val rootFontGlyph = lowerName.startsWith("font/glyph_") && lowerName.endsWith(".png")
+                if (rootFontGlyph) rootFontGlyphCount++
                 if (lowerName.startsWith("models/") && lowerName.endsWith(".json")) {
                     modelFileCount++
                     val modelBytes = if (entry.size > MAX_MODEL_BYTES) null else
@@ -85,16 +159,33 @@ public class PackAuditor {
                 if (!isTexture(lowerName)) continue
                 textureFileCount++
                 val dimensions = zip.getInputStream(entry).use { readTextureDimensions(lowerName, it) }
+                if (lowerName == "pack_icon.png") rootPackIconDimensions = dimensions
                 if (dimensions == null) {
                     unmeasuredTextureCount++
+                    if (unmeasuredTextureExamples.size < 3) {
+                        val safePath = entry.name.filter {
+                            !Character.isISOControl(it) && it != '§' && Character.getType(it) != Character.FORMAT.toInt()
+                        }
+                        unmeasuredTextureExamples += safePath.take(80) + if (safePath.length > 80) "…" else ""
+                    }
                     continue
                 }
 
                 val imageMemoryBytes = dimensions.width.toLong() * dimensions.height.toLong() * 4L
+                if (imageMemoryBytes > PackAuditReport.CREATOR_TOOLS_HIGHEST_RESOLUTION_MIP_WARNING_BYTES) {
+                    texturesOverHighestResolutionMipBudget++
+                }
                 textureMemoryBytes = try {
                     Math.addExact(textureMemoryBytes, imageMemoryBytes)
                 } catch (_: ArithmeticException) {
                     throw IOException("Texture-memory estimate overflows a 64-bit counter")
+                }
+                if (rootFontGlyph) {
+                    rootFontGlyphTextureMemoryBytes = try {
+                        Math.addExact(rootFontGlyphTextureMemoryBytes, imageMemoryBytes)
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Root font texture-memory estimate overflows a 64-bit counter")
+                    }
                 }
                 if (lowerName in textureReferences.atlasPaths) {
                     if (imageMemoryBytes > largestPotentialAtlasTextureMemoryBytes) {
@@ -105,6 +196,20 @@ public class PackAuditor {
                         potentialAtlasTexturesOverBudgetCount++
                     }
                 }
+                if (lowerName in textureReferences.itemAtlasPaths) {
+                    itemAtlasTextureMemoryBytes = try {
+                        Math.addExact(itemAtlasTextureMemoryBytes, imageMemoryBytes)
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Item-atlas texture-memory estimate overflows a 64-bit counter")
+                    }
+                }
+                if (lowerName in textureReferences.blockAtlasPaths) {
+                    blockAtlasTextureMemoryBytes = try {
+                        Math.addExact(blockAtlasTextureMemoryBytes, imageMemoryBytes)
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Block-atlas texture-memory estimate overflows a 64-bit counter")
+                    }
+                }
                 maxTextureDimension = maxOf(maxTextureDimension, dimensions.width, dimensions.height)
                 if (imageMemoryBytes > largestTextureMemoryBytes) {
                     largestTexturePath = entry.name
@@ -112,31 +217,78 @@ public class PackAuditor {
                     largestTextureHeight = dimensions.height
                     largestTextureMemoryBytes = imageMemoryBytes
                 }
+                recordTextureHotspot(textureHotspots, PackAuditReport.TextureHotspot(
+                    entry.name, dimensions.width, dimensions.height, imageMemoryBytes
+                ))
             }
         }
         estimatedTextureHandleCount = textureReferences.estimatedHandleCount
+        val atlasReferenceScanComplete = textureReferences.atlasScanComplete && !opaqueBedrockArchivePresent
+        val textureHandleScanComplete = textureReferences.handleScanComplete && !opaqueBedrockArchivePresent
+        val textureMetricsComplete = unmeasuredTextureCount == 0 && !opaqueBedrockArchivePresent
 
         val warnings = TreeSet<String>()
+        when {
+            rootPackIconCount == 0 -> warnings += "root pack_icon.png is missing (Creator Tools CPACKICON101)"
+            rootPackIconCount > 1 -> warnings += "multiple root pack_icon.png entries found (Creator Tools CPACKICON102)"
+            rootPackIconDimensions == null -> warnings += "root pack_icon.png could not be validated as a PNG"
+            rootPackIconDimensions.width != rootPackIconDimensions.height -> warnings +=
+                "root pack_icon.png is ${rootPackIconDimensions.width}x${rootPackIconDimensions.height}; Creator Tools recommends a square icon, typically 256x256 (CPACKICON104)"
+        }
+        if (opaqueBedrockArchivePresent) {
+            warnings += "Bedrock __brarchive data is opaque to Fettle; decoded textures, atlas references, texture handles, and packed-entry counts are incomplete"
+        }
         if (uncompressedBytes > 100L * MIB) warnings += "uncompressed pack exceeds 100 MiB"
-        if (fileCount > 2_500) warnings += "pack has more than 2,500 files"
+        if (fileCount > PackAuditReport.MOJANG_HIGH_PACK_FILE_COUNT) {
+            warnings += "pack exceeds 10,000 files; Mojang has seen packs at this size run out of memory on some devices"
+        } else if (fileCount > PackAuditReport.MOJANG_SAFER_PACK_FILE_COUNT) {
+            warnings += "pack exceeds Mojang's 5,000–7,000 safer file-count range; recommended to stay under 10,000"
+        }
         if (estimatedTextureHandleCount > PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE) {
             warnings += "$estimatedTextureHandleCount estimated distinct texture handles exceed Creator Tools' ${PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE}-handle add-on guidance"
         }
-        if (textureMemoryBytes > 256L * MIB) warnings += "decoded texture estimate exceeds 256 MiB"
+        if (textureMemoryBytes > 256L * MIB) {
+            warnings += "decoded texture estimate exceeds Fettle's 256 MiB warning threshold; this is not an official crash limit"
+        }
+        if (texturesOverHighestResolutionMipBudget > 0) {
+            val examples = textureHotspots.filter {
+                it.memoryBytes > PackAuditReport.CREATOR_TOOLS_HIGHEST_RESOLUTION_MIP_WARNING_BYTES
+            }.take(3).joinToString { it.path }
+            warnings += "$texturesOverHighestResolutionMipBudget textures exceed Creator Tools' 4 MiB highest-resolution-mip warning budget" +
+                if (examples.isEmpty()) "" else " (examples: $examples)"
+        }
         if (maxTextureDimension > 2_048) warnings += "a texture exceeds 2048px"
-        if (unmeasuredTextureCount > 0) warnings += "$unmeasuredTextureCount textures could not be measured; AUTO cannot verify the decoded texture budget"
+        if (unmeasuredTextureCount > 0) {
+            val examples = unmeasuredTextureExamples.joinToString(", ").takeIf { it.isNotEmpty() }
+                ?.let { " (examples: $it)" }.orEmpty()
+            warnings += "$unmeasuredTextureCount textures could not be measured$examples; AUTO cannot verify the decoded texture budget"
+        }
         if (oversizedModelCount > 0) warnings += "$oversizedModelCount model files exceeded the bounded complexity scan"
         if (pngAnimationMetadataCount > 0) warnings += "$pngAnimationMetadataCount PNG animation metadata files keep their textures at source resolution"
         if (potentialAtlasTexturesOverBudgetCount > 0) {
             warnings += "$potentialAtlasTexturesOverBudgetCount potential atlas texture(s) exceed Creator Tools' 256px maximum-dimension guidance"
         }
-        if (rootFontGlyphCount > 0) {
-            warnings += "$rootFontGlyphCount root font glyph page(s) are outside the documented texts/<language>/font path; Fettle still counts them conservatively"
+        val estimatedItemAtlasAllocation = PackAuditReport.roundedAtlasAllocationBytes(itemAtlasTextureMemoryBytes)
+        val estimatedBlockAtlasAllocation = PackAuditReport.roundedAtlasAllocationBytes(blockAtlasTextureMemoryBytes)
+        if (estimatedItemAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_WARNING_BYTES) {
+            warnings += "estimated Bedrock item-atlas allocation rounds up to $estimatedItemAtlasAllocation bytes"
         }
-        if (!textureReferences.atlasScanComplete) {
+        if (estimatedBlockAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_WARNING_BYTES) {
+            warnings += "estimated Bedrock block-atlas allocation rounds up to $estimatedBlockAtlasAllocation bytes"
+        }
+        if (estimatedItemAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES ||
+            estimatedBlockAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES
+        ) {
+            warnings += "estimated Bedrock atlas allocation exceeds Creator Tools' 256 MiB hard limit; this is a validator limit, not a client crash guarantee"
+        }
+        if (rootFontGlyphCount > 0) {
+            warnings += "$rootFontGlyphCount root font glyph page(s) are outside the documented texts/<language>/font path; " +
+                "$rootFontGlyphTextureMemoryBytes measured decoded bytes are counted conservatively"
+        }
+        if (!atlasReferenceScanComplete) {
             warnings += "Atlas references could not be fully scanned; atlas-size guidance is incomplete"
         }
-        if (!textureReferences.handleScanComplete) {
+        if (!textureHandleScanComplete) {
             warnings += "Texture-handle references could not be fully scanned; the handle estimate is incomplete"
         }
         if (blockModelFilesOver50Cubes > 0) {
@@ -163,13 +315,30 @@ public class PackAuditor {
             modelFileCount = modelFileCount,
             maxModelCubes = maxModelCubes,
             largestModelPath = largestModelPath,
-            textureMetricsComplete = unmeasuredTextureCount == 0,
-            atlasReferenceScanComplete = textureReferences.atlasScanComplete,
-            textureHandleScanComplete = textureReferences.handleScanComplete,
+            textureMetricsComplete = textureMetricsComplete,
+            atlasReferenceScanComplete = atlasReferenceScanComplete,
+            textureHandleScanComplete = textureHandleScanComplete,
             unmeasuredTextureCount = unmeasuredTextureCount,
             pngAnimationMetadataCount = pngAnimationMetadataCount,
             warnings = warnings.toList(),
+            textureHotspots = textureHotspots.toList(),
+            oversizedModelCount = oversizedModelCount,
+            rootFontGlyphCount = rootFontGlyphCount,
+            rootFontGlyphTextureMemoryBytes = rootFontGlyphTextureMemoryBytes,
+            itemAtlasTextureMemoryBytes = itemAtlasTextureMemoryBytes,
+            blockAtlasTextureMemoryBytes = blockAtlasTextureMemoryBytes,
+            opaqueBedrockArchivePresent = opaqueBedrockArchivePresent,
         )
+    }
+
+    private fun recordTextureHotspot(
+        hotspots: MutableList<PackAuditReport.TextureHotspot>,
+        candidate: PackAuditReport.TextureHotspot,
+    ) {
+        val insertAt = hotspots.indexOfFirst { it.memoryBytes < candidate.memoryBytes }
+        if (insertAt >= 0) hotspots.add(insertAt, candidate)
+        else if (hotspots.size < MAX_TEXTURE_HOTSPOTS) hotspots.add(candidate)
+        if (hotspots.size > MAX_TEXTURE_HOTSPOTS) hotspots.removeAt(MAX_TEXTURE_HOTSPOTS)
     }
 
     private fun readTextureDimensions(name: String, input: InputStream): Dimensions? {
@@ -323,6 +492,8 @@ public class PackAuditor {
 
     private fun findTextureReferences(zip: ZipFile): TextureReferenceScan {
         val atlasPaths = HashSet<String>()
+        val itemAtlasPaths = HashSet<String>()
+        val blockAtlasPaths = HashSet<String>()
         val handlePaths = HashSet<String>()
         var scannedBytes = 0L
         var scannedFiles = 0
@@ -333,10 +504,14 @@ public class PackAuditor {
             val entry = entries.nextElement()
             if (entry.isDirectory) continue
             val name = entry.name.lowercase(Locale.ROOT)
-            val atlasSource = isAtlasReferenceSource(name)
+            val itemAtlasSource = isItemAtlasReferenceSource(name)
+            val blockAtlasSource = name == "textures/terrain_texture.json"
+            val atlasSource = itemAtlasSource || blockAtlasSource
             val handleSource = isTextureHandleReferenceSource(name)
             if (!atlasSource && !handleSource) continue
-            if (++scannedFiles > MAX_TEXTURE_REFERENCE_FILES) return TextureReferenceScan(atlasPaths, handlePaths.size, false, false)
+            if (++scannedFiles > MAX_TEXTURE_REFERENCE_FILES) return TextureReferenceScan(
+                atlasPaths, itemAtlasPaths, blockAtlasPaths, handlePaths.size, false, false
+            )
             val bytes = zip.getInputStream(entry).use { readBounded(it, MAX_ATLAS_REFERENCE_FILE_BYTES) }
             if (bytes == null) {
                 if (atlasSource) atlasScanComplete = false
@@ -344,7 +519,7 @@ public class PackAuditor {
                 continue
             }
             if (scannedBytes > MAX_ATLAS_REFERENCE_TOTAL_BYTES - bytes.size) {
-                return TextureReferenceScan(atlasPaths, handlePaths.size, false, false)
+                return TextureReferenceScan(atlasPaths, itemAtlasPaths, blockAtlasPaths, handlePaths.size, false, false)
             }
             scannedBytes += bytes.size
             val text = try {
@@ -364,15 +539,22 @@ public class PackAuditor {
                 if (handleSource) handleScanComplete = false
                 continue
             }
-            if (atlasSource) strings.mapNotNullTo(atlasPaths, ::atlasTexturePath)
+            if (atlasSource) {
+                for (value in strings) {
+                    val path = atlasTexturePath(value) ?: continue
+                    atlasPaths += path
+                    if (itemAtlasSource) itemAtlasPaths += path
+                    if (blockAtlasSource) blockAtlasPaths += path
+                }
+            }
             if (handleSource) strings.mapNotNullTo(handlePaths, ::textureHandlePath)
         }
-        return TextureReferenceScan(atlasPaths, handlePaths.size, atlasScanComplete, handleScanComplete)
+        return TextureReferenceScan(atlasPaths, itemAtlasPaths, blockAtlasPaths, handlePaths.size,
+            atlasScanComplete, handleScanComplete)
     }
 
-    private fun isAtlasReferenceSource(name: String): Boolean =
-        name == "textures/item_texture.json" || name == "textures/terrain_texture.json" ||
-            name.startsWith("attachables/") && name.endsWith(".json")
+    private fun isItemAtlasReferenceSource(name: String): Boolean =
+        name == "textures/item_texture.json" || name.startsWith("attachables/") && name.endsWith(".json")
 
     private fun isTextureHandleReferenceSource(name: String): Boolean =
         // shortcut: path-like strings in these schemas match Creator Tools' handle sources; add schema parsing for new forms.
@@ -406,6 +588,8 @@ public class PackAuditor {
     private data class Dimensions(val width: Int, val height: Int)
     private data class TextureReferenceScan(
         val atlasPaths: Set<String>,
+        val itemAtlasPaths: Set<String>,
+        val blockAtlasPaths: Set<String>,
         val estimatedHandleCount: Int,
         val atlasScanComplete: Boolean,
         val handleScanComplete: Boolean,
@@ -420,6 +604,7 @@ public class PackAuditor {
         const val MAX_MODEL_BYTES = 4 * 1024 * 1024
         const val MAX_JPEG_HEADER_BYTES = 1024 * 1024
         const val MAX_TEXTURE_DIMENSION = 32_768
+        const val MAX_TEXTURE_HOTSPOTS = 3
         val CUBE_ARRAY_START = Regex("\"cubes\"\\s*:\\s*\\[")
         val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
         val PNG_IHDR_PREFIX = byteArrayOf(0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52)

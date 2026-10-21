@@ -93,7 +93,7 @@ public final class FettleExtension implements Extension {
                this.variantManager.prepare(source, PackProfile.FULL);
             } catch (Throwable throwable) {
                this.logger().warning("fettle could not audit fixed pack " + source.uuid() + ": "
-                  + throwable.getClass().getSimpleName());
+                  + failureDescription(throwable));
             }
             continue;
          }
@@ -104,7 +104,10 @@ public final class FettleExtension implements Extension {
          long preparationStarted = System.nanoTime();
          try {
             Map<java.util.UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared =
-               this.variantManager.prepareSet(targets, PackVariantManager.PREWARM_PROFILES);
+               this.variantManager.prepareSet(targets, packs, PackVariantManager.PREWARM_PROFILES);
+            if (!this.variantManager.variantIdentitiesSafe()) {
+               this.logger().warning("fettle left optimized variants disabled because required-pack dependencies reference a target pack UUID or could not be verified; original required packs remain selected.");
+            }
             for (ResourcePack source : targets) {
                Map<PackProfile, PackVariantManager.PreparedVariant> variants = prepared.get(source.uuid());
                if (variants == null) continue;
@@ -121,22 +124,18 @@ public final class FettleExtension implements Extension {
             this.logger().info("fettle prepared " + targets.size() + " linked pack(s) in "
                + ((System.nanoTime() - preparationStarted) / 1_000_000L) + " ms.");
          } catch (Throwable throwable) {
-            this.logger().warning("fettle linked-pack preparation failed: " + throwable.getClass().getSimpleName()
+            this.logger().warning("fettle linked-pack preparation failed: " + failureDescription(throwable)
                + "; required source packs remain available.");
          }
       }
       try {
-         PackVariantManager.CachePruneResult result =
-            this.variantManager.pruneExpiredArtifacts(packs);
-         if (result.removedArtifacts() > 0) {
-            this.logger().info("fettle removed " + result.removedArtifacts() + " inactive pack-cache artifact(s).");
-         }
-         if (result.activeExceedsLimit()) {
-            this.logger().warning("fettle's current generated variants use " + this.humanBytes(result.activeBytes())
-               + ", above the 2 GiB inactive-cache target; active variants were retained.");
+         PackVariantManager.CacheUsage usage = this.variantManager.cacheUsage();
+         if (usage.overWarningThreshold()) {
+            this.logger().warning("fettle's pack-cache contains " + this.humanBytes(usage.bytes())
+               + ", above the 2 GiB advisory target; cache files were retained.");
          }
       } catch (Exception | LinkageError failure) {
-         this.logger().warning("fettle could not prune inactive pack-cache artifacts: "
+         this.logger().warning("fettle could not inspect pack-cache size: "
             + failure.getClass().getSimpleName());
       }
       this.preparedPackSetAudit = PackSetAudit.forSession(null, packs, this::matchesTargetPack, this.variantManager);
@@ -157,6 +156,10 @@ public final class FettleExtension implements Extension {
          packSetAudit);
       BedrockDeviceCapabilities capabilities = plan.capabilities();
       boolean automatic = plan.automatic();
+      if (automatic && this.variantManager != null && !packSetAudit.preparedPackStackMatches()) {
+         this.logger().warning("fettle skipped optimized profiles for " + connection.bedrockUsername()
+            + " because this session's required-pack stack or target set differs from the prewarmed set; original required packs remain selected.");
+      }
       DeviceProfilePolicy.Selection selection = plan.selection();
       Map<java.util.UUID, PackProfile> selectedProfiles = new java.util.LinkedHashMap<>();
 
@@ -184,7 +187,12 @@ public final class FettleExtension implements Extension {
       }
 
       String scaffoldingAnimation = ScaffoldingPackPolicy.selectedAnimation(event.resourcePacks());
-      SessionDeviceSnapshot snapshot = plan.snapshot(selectedProfiles, scaffoldingAnimation);
+      int geyserProtocolVersion = -1;
+      try {
+         geyserProtocolVersion = connection.protocolVersion();
+      } catch (RuntimeException | LinkageError ignored) {
+      }
+      SessionDeviceSnapshot snapshot = plan.snapshot(selectedProfiles, scaffoldingAnimation, geyserProtocolVersion);
       if (automatic && snapshot.textureHandleMetricsComplete() && snapshot.estimatedTextureHandleUpperBound()
          > PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE) {
          this.logger().warning("fettle estimates up to " + snapshot.estimatedTextureHandleUpperBound() + " referenced texture handles "
@@ -192,17 +200,32 @@ public final class FettleExtension implements Extension {
             + "; texture resizing does not reduce handle count (Creator Tools' add-on guidance is "
             + PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE + ").");
       }
+      if (automatic && !snapshot.atlasMetricsComplete()) {
+         this.logger().warning("fettle could not completely measure the selected atlas references for "
+            + connection.bedrockUsername() + "; AUTO cannot verify Fettle's conservative 256 MiB stack-atlas policy.");
+      } else if (automatic && !snapshot.withinStackAtlasPolicy()) {
+         this.logger().warning("fettle's selected required-pack set for " + connection.bedrockUsername()
+            + " estimates combined item/block atlas allocations of "
+            + this.humanBytes(PackAuditReport.roundedAtlasAllocationBytes(snapshot.estimatedItemAtlasTextureBytes()))
+            + "/" + this.humanBytes(PackAuditReport.roundedAtlasAllocationBytes(snapshot.estimatedBlockAtlasTextureBytes()))
+            + "; this exceeds Fettle's conservative 256 MiB per-type stack-atlas policy. Creator Tools validates individual packs; "
+            + "this aggregate estimate is not a verified Bedrock runtime limit.");
+      }
       if (automatic && !snapshot.budgetKnown()) {
          String tier = plan.selectionMemoryTier() == null
             ? "no usable MemoryTier was reported"
             : "selection MemoryTier " + plan.selectionMemoryTier() + " has no configured texture budget";
          String selected = selectedProfiles.values().stream().distinct().map(PackProfile::name).sorted().toList().toString();
          this.logger().warning("fettle found " + tier + " for " + connection.bedrockUsername()
-            + "; AUTO selected " + selected + ".");
+            + " (clientDataDecoded=" + capabilities.getClientDataDecoded()
+            + ", DeviceOS=" + capabilities.getDeviceOs()
+            + ", MemoryTierClaim=" + capabilities.getMemoryTierClaimStatus()
+            + "); AUTO selected " + selected + " under a conservative "
+            + this.humanBytes(snapshot.textureBudgetBytes()) + " selection cap (not a device measurement).");
       } else if (automatic && !snapshot.withinBudget()) {
          this.logger().warning(
             "fettle's selected required-pack set for " + connection.bedrockUsername() + " estimates "
-               + this.humanBytes(snapshot.estimatedTextureBytes()) + " texture memory against a "
+               + this.humanBytes(snapshot.estimatedResourceMemoryBytes()) + " decoded-texture-plus-atlas memory against a "
                + this.humanBytes(snapshot.textureBudgetBytes())
                + (plan.defaultTierBudget() ? " automatic MemoryTier budget" : " configured MemoryTier budget")
                + (snapshot.metricsComplete() ? "." : " (incomplete measurement).")
@@ -215,16 +238,20 @@ public final class FettleExtension implements Extension {
    @Subscribe
    public void onSessionJoin(SessionJoinEvent event) {
       GeyserConnection connection = event.connection();
-      SessionDeviceSnapshot snapshot = this.deviceProfiles.session(connection);
+      SessionDeviceSnapshot snapshot = this.deviceProfiles.recordPostInitializationJoin(connection);
       if (snapshot != null) {
+         String memoryTier = snapshot.selectionMemoryTier() == null
+            ? "with unknown Bedrock MemoryTier"
+            : "from Bedrock MemoryTier " + snapshot.selectionMemoryTier();
          this.logger().info("fettle delivered " + snapshot.selectedProfiles().values().stream()
             .distinct().map(PackProfile::name).sorted().toList() + " to " + connection.bedrockUsername()
-            + " from Bedrock MemoryTier " + snapshot.selectionMemoryTier() + ".");
+            + " " + memoryTier + ".");
       }
    }
 
-   @Subscribe
+   @Subscribe(postOrder = PostOrder.FIRST)
    public void onSessionDisconnect(SessionDisconnectEvent event) {
+      this.deviceProfiles.recordDisconnectBeforeInitialization(event.connection(), event.disconnectReason());
       this.deviceProfiles.removeSession(event.connection());
    }
 
@@ -234,12 +261,36 @@ public final class FettleExtension implements Extension {
          Command.builder(this)
             .source(CommandSource.class)
             .name("status")
-            .description("Show the fettle pack optimizer profile.")
+            .description("Show fettle profile and live Bedrock capability coverage.")
             .permission("fettle.admin")
             .playerOnly(false)
             .executor((source, command, args) -> {
+               DeviceProfileRuntime.Summary summary = this.deviceProfiles.summary();
                source.sendMessage("§afettle profile: §f" + this.profile.name());
                source.sendMessage("§7Cached pack audits/variants: §f" + (this.variantManager == null ? 0 : this.variantManager.size()));
+               source.sendMessage("§7Fettle-tracked Bedrock sessions: §f" + summary.trackedSessions()
+                  + "§7, no usable MemoryTier: §f" + summary.missingMemoryTier()
+                  + "§7, client data undecoded: §f" + summary.undecodedClientData());
+               source.sendMessage("§7MemoryTier counts: §f" + summary.memoryTiers()
+                  + "§7, by platform: §f" + summary.memoryTiersByPlatform());
+               source.sendMessage("§7Missing tier by platform/GameVersion/Protocol: §f" + summary.missingMemoryTierByPlatform()
+                  + "§7, unknown platform: §f" + summary.missingMemoryTierUnknownPlatform());
+               source.sendMessage("§7Unusable MemoryTier claim reasons: §f" + summary.memoryTierFailures());
+               source.sendMessage("§7Session profile sets: §f" + summary.profileSets());
+               source.sendMessage("§7Selection budget/atlas outcomes by platform/version/protocol/graphics/tier/profile: §f"
+                  + summary.selectionOutcomes());
+               source.sendMessage("§7Selections awaiting Geyser initialization (not download progress): §f"
+                  + summary.pendingInitialization());
+               source.sendMessage("§7Pack-selection attempts since startup by platform/protocol/graphics/tier/profile: §f"
+                  + summary.packJoinAttemptCounts());
+               source.sendMessage("§7Post-initialization joins since startup (not rendering proof): §f"
+                  + summary.postInitializationJoinCounts());
+               source.sendMessage("§7Average selection-to-initialized time ms (includes download/auth/world init; no version grouping): §f"
+                  + summary.postInitializationAverageMillis());
+               source.sendMessage("§7Pre-initialization disconnects since startup (not crash proof): §f"
+                  + summary.preInitializationDisconnectCounts());
+               source.sendMessage("§7Geyser resource-pack-reason disconnects (version not retained; not crash proof): §f"
+                  + summary.resourcePackReasonDisconnectCounts());
             })
             .build()
       );
@@ -268,26 +319,42 @@ public final class FettleExtension implements Extension {
                   : capabilities.getDeviceModel().replace("§", "");
                String textureBudget = snapshot.budgetKnown()
                   ? this.humanBytes(snapshot.textureBudgetBytes())
-                  : "unknown (Bedrock did not report MemoryTier)";
+                  : snapshot.textureBudgetBytes() > 0
+                     ? "unknown (conservative AUTO cap " + this.humanBytes(snapshot.textureBudgetBytes()) + ")"
+                  : capabilities.getClientDataDecoded()
+                     ? "unknown (decoded client data has no usable MemoryTier)"
+                     : "unknown (client data unavailable or unparseable)";
                String animationVariant = snapshot.scaffoldingAnimationVariant() == null
                   ? "not present"
                   : snapshot.scaffoldingAnimationVariant();
+               long packFileCount = snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null)
+                  .mapToLong(pack -> pack.report().getFileCount())
+                  .sum();
+               boolean packFileCountComplete = snapshot.packAudits().stream().allMatch(pack -> pack.report() != null);
                source.sendMessage(
                   "§afettle device claims for §f"
                      + xuid
                      + "§a: platform=§f"
                      + String.valueOf(capabilities.getPlatform())
+                     + "§a, clientDataDecoded=§f"
+                     + capabilities.getClientDataDecoded()
                      + "§a, DeviceOS=§f"
                      + String.valueOf(capabilities.getDeviceOs())
+                     + (capabilities.getDeviceOsLabel() == null ? "" : " (" + capabilities.getDeviceOsLabel() + ")")
                      + "§a, model=§f"
                      + model
                      + "§a, gameVersion=§f"
                      + String.valueOf(capabilities.getGameVersion())
+                     + "§a, protocolVersion=§f"
+                     + snapshot.geyserProtocolVersion()
                      + "§a, MemoryTier=§f"
                      + String.valueOf(capabilities.getMemoryTier())
                      + " ("
                      + capabilities.getMemoryTierDescription()
                      + ")"
+                     + "§a, MemoryTierClaim=§f"
+                     + capabilities.getMemoryTierClaimStatus()
                );
                source.sendMessage(
                   "§7viewDistance="
@@ -300,11 +367,30 @@ public final class FettleExtension implements Extension {
                      + String.valueOf(snapshot.selectionMemoryTier())
                      + ", scaffoldingAnimation="
                      + animationVariant
+                     + ", packArchiveBytes~="
+                     + snapshot.packAudits().stream()
+                        .filter(pack -> pack.report() != null)
+                        .map(pack -> pack.name().replace("§", "") + " (" + pack.profile() + ")="
+                           + this.humanBytes(pack.report().getArchiveBytes()))
+                        .toList()
+                     + ", packFiles~="
+                     + packFileCount
+                     + (packFileCountComplete ? "" : " (partial)")
                      + ", textureEstimate="
                      + this.humanBytes(snapshot.estimatedTextureBytes())
+                     + ", texturePlusAtlasEstimate="
+                     + this.humanBytes(snapshot.estimatedResourceMemoryBytes())
                      + ", textureFiles~="
                      + snapshot.estimatedTextureFileCount()
                      + (snapshot.metricsComplete() ? "" : " (partial)")
+                     + ", stackItemAtlasEstimate~="
+                     + this.humanBytes(PackAuditReport.roundedAtlasAllocationBytes(snapshot.estimatedItemAtlasTextureBytes()))
+                     + ", stackBlockAtlasEstimate~="
+                     + this.humanBytes(PackAuditReport.roundedAtlasAllocationBytes(snapshot.estimatedBlockAtlasTextureBytes()))
+                     + ", atlasMetrics="
+                     + (snapshot.atlasMetricsComplete() ? "complete" : "partial")
+                     + ", stackAtlasPolicyFit="
+                     + (snapshot.atlasMetricsComplete() ? Boolean.toString(snapshot.withinStackAtlasPolicy()) : "unknown")
                      + ", textureHandles~="
                      + snapshot.estimatedTextureHandleUpperBound()
                      + (snapshot.textureHandleMetricsComplete() ? "" : " (partial)")
@@ -317,12 +403,72 @@ public final class FettleExtension implements Extension {
                      + textureBudget
                      + ", budgetSource="
                      + (snapshot.defaultTierBudget() ? "automatic-MemoryTier-budget"
-                        : snapshot.budgetKnown() ? "configured-MemoryTier-budget" : "no-MemoryTier")
+                        : snapshot.budgetKnown() ? "configured-MemoryTier-budget"
+                           : snapshot.textureBudgetBytes() > 0 ? "conservative-unknown-tier-cap" : "no-usable-MemoryTier")
                      + ", budgetFit="
                      + (snapshot.budgetKnown() && snapshot.metricsComplete() ? Boolean.toString(snapshot.withinBudget()) : "unknown")
                      + ", selectedProfiles="
                      + snapshot.selectedProfiles()
                );
+               List<PackSetAudit.PackAuditSnapshot> largestModels = snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null && pack.report().getLargestModelPath() != null)
+                  .sorted(java.util.Comparator.comparingInt(
+                     (PackSetAudit.PackAuditSnapshot pack) -> pack.report().getMaxModelCubes()).reversed())
+                  .limit(3)
+                  .toList();
+               if (!largestModels.isEmpty()) {
+                  source.sendMessage("§7Static model scan (separate from texture budget and live entities):");
+                  largestModels.forEach(pack -> {
+                     PackAuditReport report = pack.report();
+                     source.sendMessage("§7" + pack.name().replace("§", "") + " (" + pack.profile() + "): "
+                        + report.getModelFileCount() + " model files; "
+                        + report.getLargestModelPath().replace("§", "") + " ("
+                        + report.getMaxModelCubes() + " cubes).");
+                  });
+               }
+               snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null)
+                  .forEach(pack -> pack.report().getWarnings().stream()
+                     .filter(warning -> warning.contains("block model file") && warning.contains("50 cubes"))
+                     .forEach(warning -> source.sendMessage("§eBlock geometry "
+                        + pack.name().replace("§", "") + " (" + pack.profile() + "): " + warning)));
+               snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null && pack.report().getRootFontGlyphCount() > 0)
+                  .forEach(pack -> source.sendMessage("§7Root font pages in " + pack.name().replace("§", "")
+                     + " (" + pack.profile() + "): " + pack.report().getRootFontGlyphCount() + " page(s), "
+                     + this.humanBytes(pack.report().getRootFontGlyphTextureMemoryBytes())
+                     + " measured; outside the documented path and counted conservatively."));
+               snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null && pack.report().getOversizedModelCount() > 0)
+                  .forEach(pack -> source.sendMessage("§eStatic model scan incomplete for "
+                     + pack.name().replace("§", "") + ": " + pack.report().getOversizedModelCount()
+                     + " model file(s) exceeded the scan bound."));
+               List<PackSetAudit.PackAuditSnapshot> incompletePacks = snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() == null || !pack.report().getTextureMetricsComplete())
+                  .toList();
+               if (!incompletePacks.isEmpty()) {
+                  incompletePacks.forEach(pack -> {
+                     PackAuditReport report = pack.report();
+                     source.sendMessage("§ePack measurement: §f" + pack.name() + " §7(" + pack.id() + ", "
+                        + pack.profile() + ") §e" + (report == null ? "audit unavailable."
+                           : report.getUnmeasuredTextureCount() + " texture(s) unmeasured; known estimate "
+                              + this.humanBytes(report.getTextureMemoryBytes()) + "."));
+                     if (report != null) {
+                        report.getWarnings().stream()
+                           .filter(warning -> warning.contains("textures could not be measured"))
+                           .forEach(warning -> source.sendMessage("§7" + warning));
+                     }
+                  });
+               } else if (!snapshot.budgetKnown() || !snapshot.withinBudget()) {
+                  snapshot.packAudits().stream()
+                     .filter(pack -> pack.report() != null)
+                     .sorted(java.util.Comparator.comparingLong(
+                        (PackSetAudit.PackAuditSnapshot pack) -> pack.report().getTextureMemoryBytes()).reversed())
+                     .limit(3)
+                     .forEach(pack -> source.sendMessage("§7Largest pack cost: §f" + pack.name() + " §7("
+                        + pack.profile() + ", " + pack.id() + "): §f"
+                        + this.humanBytes(pack.report().getTextureMemoryBytes()) + "."));
+               }
             })
             .build()
       );
@@ -378,6 +524,7 @@ public final class FettleExtension implements Extension {
                               "§afettle " + kind + " §7(" + cached.pack().uuid() + "): §f"
                                  + report.getFileCount() + " files, " + report.getTextureFileCount() + " textures, "
                                  + report.getEstimatedTextureHandleCount() + " estimated handles, "
+                                 + this.humanBytes(report.getArchiveBytes()) + " archive, "
                                  + String.format(Locale.ROOT, "%.1f MiB", report.getTextureMemoryMiB())
                                  + " texture memory; " + report.getModelFileCount() + " models, max "
                                  + report.getMaxModelCubes() + " cubes; metrics complete="
@@ -390,6 +537,11 @@ public final class FettleExtension implements Extension {
                                     + this.humanBytes(report.getLargestTextureMemoryBytes()) + ")."
                               );
                            }
+                           report.getTextureHotspots().stream().skip(1).limit(2).forEach(hotspot ->
+                              source.sendMessage("§7Next texture: §f" + hotspot.getPath().replace("§", "") + " §7("
+                                 + hotspot.getWidth() + "x" + hotspot.getHeight() + ", "
+                                 + this.humanBytes(hotspot.getMemoryBytes()) + ").")
+                           );
                            if (report.getLargestPotentialAtlasTexturePath() != null) {
                               source.sendMessage(
                                  "§7Largest atlas candidate: §f" + report.getLargestPotentialAtlasTexturePath().replace("§", "")
@@ -401,6 +553,11 @@ public final class FettleExtension implements Extension {
                                  "§7Largest model: §f" + report.getLargestModelPath().replace("§", "") + " §7("
                                     + report.getMaxModelCubes() + " cubes)."
                               );
+                           }
+                           if (report.getRootFontGlyphCount() > 0) {
+                              source.sendMessage("§7Root font glyph pages: " + report.getRootFontGlyphCount()
+                                 + ", measured memory " + this.humanBytes(report.getRootFontGlyphTextureMemoryBytes())
+                                 + "; outside the documented path, counted conservatively.");
                            }
                            report.getWarnings().forEach(warning -> source.sendMessage("§e- " + warning));
                         });
@@ -513,12 +670,9 @@ public final class FettleExtension implements Extension {
    }
 
    private ResourcePack preparedVariant(PackSetAudit packSetAudit, ResourcePack original, PackProfile selectedProfile) {
-      Map<PackProfile, PackVariantManager.PreparedVariant> variants = packSetAudit.preparedVariants().get(original.uuid());
-      PackVariantManager.PreparedVariant variant = variants == null ? null : variants.get(selectedProfile);
-      if (variant != null && (variant.file() == null || Files.isRegularFile(variant.file()))) {
-         return variant.pack();
-      }
-      return this.variantManager == null ? null : this.variantManager.prepared(original, selectedProfile);
+      PackVariantManager.PreparedVariant variant =
+         packSetAudit.preparedVariant(original, selectedProfile, this.variantManager);
+      return variant == null ? null : variant.pack();
    }
 
    private PackProfile parseOverrideProfile(String value) {
@@ -597,6 +751,14 @@ public final class FettleExtension implements Extension {
             }
          }
       }
+   }
+
+   static String failureDescription(Throwable failure) {
+      String message = failure.getMessage();
+      if (message == null || message.isBlank()) return failure.getClass().getSimpleName();
+      String safe = message.replaceAll("[\\p{Cntrl}§]", " ").trim();
+      return failure.getClass().getSimpleName() + ": "
+         + (safe.length() > 200 ? safe.substring(0, 200) + "…" : safe);
    }
 
    private boolean matchesTargetPack(ResourcePack pack) {

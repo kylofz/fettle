@@ -1,7 +1,7 @@
 package me.kylofz.fettle.optimizer
 
 /** Resource and texture metrics used to explain low-end risk. */
-public class PackAuditReport(
+public class PackAuditReport @JvmOverloads constructor(
     public val archiveBytes: Long,
     public val uncompressedBytes: Long,
     public val fileCount: Int,
@@ -29,12 +29,45 @@ public class PackAuditReport(
     public val unmeasuredTextureCount: Int,
     public val pngAnimationMetadataCount: Int,
     public val warnings: List<String>,
+    public val textureHotspots: List<TextureHotspot> = emptyList(),
+    /** Number of model files skipped because they exceeded the bounded complexity scan. */
+    public val oversizedModelCount: Int = 0,
+    /** Measured decoded bytes in root font glyph pages outside texts/<language>/font. */
+    public val rootFontGlyphCount: Int = 0,
+    public val rootFontGlyphTextureMemoryBytes: Long = 0,
+    /** Raw decoded bytes referenced by the Bedrock item atlas. */
+    public val itemAtlasTextureMemoryBytes: Long = 0,
+    /** Raw decoded bytes referenced by the Bedrock block atlas. */
+    public val blockAtlasTextureMemoryBytes: Long = 0,
+    /** True when packed Bedrock resources are present but opaque to Fettle's archive scanner. */
+    public val opaqueBedrockArchivePresent: Boolean = false,
 ) {
+    public data class TextureHotspot(
+        public val path: String,
+        public val width: Int,
+        public val height: Int,
+        public val memoryBytes: Long,
+    )
+
     public companion object {
         public const val CREATOR_TOOLS_ATLAS_MAX_DIMENSION: Int = 256
+        public const val CREATOR_TOOLS_ATLAS_MEMORY_WARNING_BYTES: Long = 64L * 1024L * 1024L
+        public const val CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES: Long = 256L * 1024L * 1024L
+        public const val CREATOR_TOOLS_HIGHEST_RESOLUTION_MIP_WARNING_BYTES: Long = 4L * 1024L * 1024L
+        public const val MOJANG_SAFER_PACK_FILE_COUNT: Int = 7_000
+        public const val MOJANG_HIGH_PACK_FILE_COUNT: Int = 10_000
         @Deprecated("Atlas guidance is dimension-based; use CREATOR_TOOLS_ATLAS_MAX_DIMENSION.")
         public const val CREATOR_TOOLS_ATLAS_WARNING_BYTES: Long = 256L * 1024L
         public const val CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE: Int = 800
+
+        /** Mirrors Creator Tools' atlas allocation estimate: round aggregate texture bytes up to a power of two. */
+        @JvmStatic
+        public fun roundedAtlasAllocationBytes(textureMemoryBytes: Long): Long {
+            if (textureMemoryBytes <= 0) return 0
+            if (textureMemoryBytes == 1L) return 1
+            val lowerPower = java.lang.Long.highestOneBit(textureMemoryBytes - 1)
+            return if (lowerPower > Long.MAX_VALUE / 2) Long.MAX_VALUE else lowerPower shl 1
+        }
     }
 
     public val textureMemoryMiB: Double

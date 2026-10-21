@@ -12,22 +12,17 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.LinkOption;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.FileTime;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HexFormat;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -36,32 +31,27 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
-import java.util.regex.Pattern;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 final class PackVariantManager {
-    static final String REWRITE_REVISION = "device-tier-v38";
+    static final String REWRITE_REVISION = "device-tier-v40";
     static final List<PackProfile> PREWARM_PROFILES = List.of(
             PackProfile.FULL, PackProfile.OPTIMIZE_FULL, PackProfile.OPTIMIZE_SEMI,
             PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
-    private static final Duration CACHE_RETENTION = Duration.ofDays(30);
-    private static final Duration TEMP_FILE_RETENTION = Duration.ofDays(1);
     private static final long MAX_CACHE_BYTES = 2L * 1024L * 1024L * 1024L;
-    private static final Pattern GENERATED_SOURCE_TEMP = Pattern.compile(
-            "^\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[A-Za-z0-9_-]+\\.source\\.mcpack$");
-    private static final Pattern GENERATED_CACHE_ARTIFACT = Pattern.compile(
-            "^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[0-9a-f]{12}[A-Za-z0-9_-]{12}"
-                    + "-(?:safe|optimize_full|optimize_semi|optimize_mini)\\.mcpack(?:\\.no-change)?$");
-    private static final Pattern GENERATED_REWRITE_TEMP = Pattern.compile(
-            "^\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[0-9a-f]{12}[A-Za-z0-9_-]{12}"
-                    + "-(?:safe|optimize_full|optimize_semi|optimize_mini)\\.mcpack[A-Za-z0-9_-]{3,}\\.tmp$");
-    private static final Pattern GENERATED_ZIP_TEMP = Pattern.compile("^\\.fettle-(?:raw|deflate)-[A-Za-z0-9_-]{3,}\\.tmp$");
     private final Path cacheDirectory;
     private final PackOptimizer optimizer = new PackOptimizer();
     private final PackAuditor auditor = new PackAuditor();
     private final Function<Path, ResourcePack> packFactory;
     private final Map<String, PreparedVariant> cache = new ConcurrentHashMap<>();
     private String activeSetFingerprint = "";
+    private String activePackStackFingerprint = "";
+    private List<Set<Integer>> activeLinkedPackGroupIndexes = List.of();
+    private Set<String> activeProtectedTexturePaths = Set.of();
+    private boolean activeCrossPackTextureDedupAllowed = true;
+    private boolean activeVariantIdentitiesSafe;
     private List<Set<UUID>> linkedProfileGroups = List.of();
 
     PackVariantManager(Path cacheDirectory) throws IOException {
@@ -98,6 +88,12 @@ final class PackVariantManager {
         boolean lossless = isLossless(profile);
         Path source = materialize(original);
         try {
+            if (Files.exists(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return new PreparedVariant(fingerprint, profile, original, null, auditor.audit(source));
+            }
+            if (auditor.hasOpaqueBedrockArchive(source)) {
+                return new PreparedVariant(fingerprint, profile, original, null, auditor.audit(source));
+            }
             PackOptimizationReport rewrite = switch (profile) {
                 case AUTO, FULL -> throw new IllegalStateException("AUTO/FULL have no generated pack");
                 case OPTIMIZE_FULL -> optimizer.optimizeForLowEnd(source, output);
@@ -125,17 +121,64 @@ final class PackVariantManager {
     synchronized Map<UUID, Map<PackProfile, PreparedVariant>> prepareSet(
             Collection<ResourcePack> originals,
             Collection<PackProfile> profiles) throws Exception {
+        return prepareSet(originals, originals, profiles);
+    }
+
+    synchronized Map<UUID, Map<PackProfile, PreparedVariant>> prepareSet(
+            Collection<ResourcePack> originals,
+            Collection<ResourcePack> packStack,
+            Collection<PackProfile> profiles) throws Exception {
         List<ResourcePack> packs = List.copyOf(originals);
-        this.activeSetFingerprint = packSetFingerprint(packs);
+        List<ResourcePack> stack = List.copyOf(packStack);
+        Map<UUID, String> stackHashes = new HashMap<>();
+        for (ResourcePack pack : stack) {
+            if (stackHashes.put(pack.uuid(), sourceHash(pack)) != null) {
+                throw new IllegalArgumentException("Resource-pack stack contains duplicate UUID " + pack.uuid());
+            }
+        }
+        for (ResourcePack pack : packs) {
+            if (!sourceHash(pack).equals(stackHashes.get(pack.uuid()))) {
+                throw new IllegalArgumentException("Every optimized pack must be present unchanged in the full stack");
+            }
+        }
+        this.activeSetFingerprint = packSetFingerprint(packs, stackHashes);
+        this.activePackStackFingerprint = packSetFingerprint(stack, stackHashes);
+        Set<UUID> targetIds = packs.stream().map(ResourcePack::uuid).collect(java.util.stream.Collectors.toSet());
+        this.activeVariantIdentitiesSafe = canAssignDistinctVariantIds(stack, targetIds);
         List<Path> groupSources = new ArrayList<>(packs.size());
+        List<Path> fixedPackSources = new ArrayList<>();
         try {
-            for (ResourcePack pack : packs) groupSources.add(materialize(pack));
-            this.linkedProfileGroups = optimizer.linkedPackGroups(groupSources).stream()
+            for (ResourcePack pack : packs) {
+                Path source = materialize(pack);
+                groupSources.add(source);
+            }
+            this.activeLinkedPackGroupIndexes = optimizer.linkedPackGroups(groupSources);
+            this.linkedProfileGroups = activeLinkedPackGroupIndexes.stream()
                     .map(group -> group.stream().map(packs::get).map(ResourcePack::uuid)
                             .collect(java.util.stream.Collectors.toUnmodifiableSet()))
                     .toList();
+            Set<String> protectedPaths = new java.util.HashSet<>();
+            boolean opaqueFixedPack = false;
+            boolean fixedReferencesComplete = true;
+            for (ResourcePack pack : stack) {
+                if (targetIds.contains(pack.uuid())) continue;
+                try {
+                    Path source = materialize(pack);
+                    fixedPackSources.add(source);
+                    opaqueFixedPack |= auditor.hasOpaqueBedrockArchive(source);
+                    protectedPaths.addAll(texturePaths(source));
+                    Set<String> references = auditor.texturePathReferences(source);
+                    if (references == null) fixedReferencesComplete = false;
+                    else protectedPaths.addAll(references);
+                } catch (IOException unmeasurableFixedPack) {
+                    opaqueFixedPack = true;
+                }
+            }
+            this.activeProtectedTexturePaths = opaqueFixedPack ? null : Set.copyOf(protectedPaths);
+            this.activeCrossPackTextureDedupAllowed = !opaqueFixedPack && fixedReferencesComplete;
         } finally {
             for (Path source : groupSources) Files.deleteIfExists(source);
+            for (Path source : fixedPackSources) Files.deleteIfExists(source);
         }
         Map<UUID, Map<PackProfile, PreparedVariant>> prepared = new LinkedHashMap<>();
         for (ResourcePack pack : packs) prepared.put(pack.uuid(), new EnumMap<>(PackProfile.class));
@@ -144,6 +187,7 @@ final class PackVariantManager {
             if (profile == PackProfile.AUTO) {
                 throw new IllegalArgumentException("AUTO is a selection strategy, not a generated pack");
             }
+            if (profile != PackProfile.FULL && !activeVariantIdentitiesSafe) continue;
             Map<UUID, PreparedVariant> setVariants = profile == PackProfile.FULL
                     ? prepareOriginalSet(packs)
                     : prepareSetVariant(packs, profile);
@@ -176,25 +220,48 @@ final class PackVariantManager {
         }
         if (allCached) return Map.copyOf(cached);
 
+        boolean occupiedCacheArtifact = originals.stream().anyMatch(original -> {
+            if (cached.containsKey(original.uuid())) return false;
+            Path output = outputFile(original, fingerprint(original, profile), profile);
+            return Files.exists(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    || isLossless(profile) && Files.exists(noChangeMarker(output), java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        });
+        if (occupiedCacheArtifact) return Map.of();
+
+        Map<UUID, PreparedVariant> losslessSources = new LinkedHashMap<>();
+        boolean allLosslessSourcesCached = profile != PackProfile.OPTIMIZE_FULL;
+        if (allLosslessSourcesCached) {
+            for (ResourcePack original : originals) {
+                String fingerprint = fingerprint(original, PackProfile.OPTIMIZE_FULL);
+                PreparedVariant variant = loadCached(original, PackProfile.OPTIMIZE_FULL,
+                        fingerprint, cacheKey(original, fingerprint));
+                if (variant == null) {
+                    allLosslessSourcesCached = false;
+                    losslessSources.clear();
+                    break;
+                }
+                losslessSources.put(original.uuid(), variant);
+            }
+        }
+
         List<Path> sources = new ArrayList<>(originals.size());
         List<Path> temporarySources = new ArrayList<>(originals.size());
         List<Path> temporaryOutputs = new ArrayList<>(originals.size());
         List<Path> finalOutputs = originals.stream()
                 .map(original -> outputFile(original, fingerprint(original, profile), profile))
                 .toList();
+        List<UUID> variantUuids = originals.stream()
+                .map(original -> variantUuid(original, fingerprint(original, profile)))
+                .toList();
         try {
             for (int index = 0; index < originals.size(); index++) {
                 ResourcePack source = originals.get(index);
                 Path sourceFile = null;
-                if (profile != PackProfile.OPTIMIZE_FULL) {
-                    String losslessFingerprint = fingerprint(source, PackProfile.OPTIMIZE_FULL);
-                    PreparedVariant losslessVariant = loadCached(source, PackProfile.OPTIMIZE_FULL,
-                            losslessFingerprint, cacheKey(source, losslessFingerprint));
-                    if (losslessVariant != null) {
-                        source = losslessVariant.pack();
-                        Path losslessFile = losslessVariant.file();
-                        if (losslessFile != null && Files.isRegularFile(losslessFile)) sourceFile = losslessFile;
-                    }
+                if (allLosslessSourcesCached) {
+                    PreparedVariant losslessVariant = losslessSources.get(source.uuid());
+                    source = losslessVariant.pack();
+                    Path losslessFile = losslessVariant.file();
+                    if (losslessFile != null && Files.isRegularFile(losslessFile)) sourceFile = losslessFile;
                 }
                 if (sourceFile == null) {
                     sourceFile = materialize(source);
@@ -205,6 +272,10 @@ final class PackVariantManager {
                         cacheDirectory, "." + finalOutputs.get(index).getFileName(), ".tmp"));
             }
 
+            if (sources.stream().anyMatch(auditor::hasOpaqueBedrockArchive)) {
+                return Map.of();
+            }
+
             int maxTextureDimension = switch (profile) {
                 case OPTIMIZE_FULL -> 0;
                 case OPTIMIZE_SEMI -> 512;
@@ -213,12 +284,14 @@ final class PackVariantManager {
                 case AUTO, FULL -> throw new IllegalStateException("AUTO/FULL have no generated pack set");
             };
             List<PackOptimizationReport> rewrites = lossless
-                    ? optimizer.optimizeForLowEndSet(sources, temporaryOutputs, 0)
-                    : optimizer.optimizeResizedPackSet(sources, temporaryOutputs, maxTextureDimension);
-            List<PackAuditReport> sourceAudits = new ArrayList<>(sources.size());
+                    ? optimizer.optimizeForLowEndSet(
+                            sources, temporaryOutputs, 0, activeLinkedPackGroupIndexes, activeProtectedTexturePaths,
+                            activeCrossPackTextureDedupAllowed, variantUuids)
+                    : optimizer.optimizeResizedPackSet(sources, temporaryOutputs, maxTextureDimension, variantUuids);
+            List<PackAuditReport> sourceAudits = lossless ? new ArrayList<>(sources.size()) : List.of();
             List<PackAuditReport> outputAudits = new ArrayList<>(sources.size());
             for (int index = 0; index < sources.size(); index++) {
-                sourceAudits.add(auditor.audit(sources.get(index)));
+                if (lossless) sourceAudits.add(auditor.audit(sources.get(index)));
                 outputAudits.add(auditor.audit(temporaryOutputs.get(index)));
             }
 
@@ -229,7 +302,13 @@ final class PackVariantManager {
                 String fingerprint = fingerprint(original, profile);
                 Path output = finalOutputs.get(index);
                 Path temporary = temporaryOutputs.get(index);
-                PackAuditReport sourceAudit = sourceAudits.get(index);
+                PackAuditReport sourceAudit = lossless ? sourceAudits.get(index) : null;
+                PreparedVariant cachedVariant = cached.get(original.uuid());
+                if (cachedVariant != null) {
+                    Files.deleteIfExists(temporary);
+                    prepared.put(original.uuid(), cachedVariant);
+                    continue;
+                }
 
                 if (lossless && (!useful || !losslessRewriteChanged(rewrites.get(index)))) {
                     Files.deleteIfExists(temporary);
@@ -241,7 +320,6 @@ final class PackVariantManager {
                     continue;
                 }
 
-                if (lossless) Files.deleteIfExists(noChangeMarker(output));
                 moveIntoPlace(temporary, output);
                 ResourcePack pack = packFactory.apply(output);
                 prepared.put(original.uuid(), remember(
@@ -264,6 +342,35 @@ final class PackVariantManager {
         }
         String fingerprint = fingerprint(original, profile);
         return loadCached(original, profile, fingerprint, cacheKey(original, fingerprint));
+    }
+
+    synchronized boolean matchesPreparedSet(Collection<ResourcePack> originals) {
+        return matchesPreparedSet(originals, originals);
+    }
+
+    synchronized boolean matchesPreparedSet(
+            Collection<ResourcePack> packStack,
+            Collection<ResourcePack> originals) {
+        try {
+            Map<UUID, String> sourceHashes = new HashMap<>();
+            for (ResourcePack pack : packStack) sourceHashes.put(pack.uuid(), sourceHash(pack));
+            return matchesPreparedSet(packStack, originals, sourceHashes);
+        } catch (RuntimeException | LinkageError invalidPackStack) {
+            return false;
+        }
+    }
+
+    synchronized boolean matchesPreparedSet(
+            Collection<ResourcePack> packStack,
+            Collection<ResourcePack> originals,
+            Map<UUID, String> sourceHashes) {
+        if (activeSetFingerprint.isEmpty() || activePackStackFingerprint.isEmpty()) return false;
+        try {
+            return activeSetFingerprint.equals(packSetFingerprint(List.copyOf(originals), sourceHashes))
+                    && activePackStackFingerprint.equals(packSetFingerprint(List.copyOf(packStack), sourceHashes));
+        } catch (Exception | LinkageError invalidPackSet) {
+            return false;
+        }
     }
 
     PreparedVariant preparedVariantIfCached(ResourcePack original, PackProfile profile) {
@@ -294,71 +401,23 @@ final class PackVariantManager {
         return result;
     }
 
-    synchronized CachePruneResult pruneExpiredArtifacts(Collection<ResourcePack> activePacks) throws IOException {
-        return pruneExpiredArtifacts(activePacks, MAX_CACHE_BYTES);
+    synchronized CacheUsage cacheUsage() throws IOException {
+        return cacheUsage(MAX_CACHE_BYTES);
     }
 
-    synchronized CachePruneResult pruneExpiredArtifacts(
-            Collection<ResourcePack> activePacks,
-            long maxCacheBytes) throws IOException {
-        if (maxCacheBytes < 0) throw new IllegalArgumentException("Pack cache limit cannot be negative");
-        Set<Path> activeArtifacts = new HashSet<>();
-        for (ResourcePack original : activePacks) {
-            for (PackProfile profile : PREWARM_PROFILES) {
-                if (profile == PackProfile.FULL) continue;
-                Path output = outputFile(original, fingerprint(original, profile), profile);
-                activeArtifacts.add(output.toAbsolutePath().normalize());
-                if (isLossless(profile)) {
-                    activeArtifacts.add(noChangeMarker(output).toAbsolutePath().normalize());
-                }
-            }
-        }
-
-        Instant cutoff = Instant.now().minus(CACHE_RETENTION);
-        Instant tempCutoff = Instant.now().minus(TEMP_FILE_RETENTION);
-        int removed = 0;
-        long activeBytes = 0;
-        long inactiveBytes = 0;
-        List<CacheArtifact> inactiveArtifacts = new ArrayList<>();
+    synchronized CacheUsage cacheUsage(long warningThresholdBytes) throws IOException {
+        if (warningThresholdBytes < 0) throw new IllegalArgumentException("Pack cache warning threshold cannot be negative");
+        long bytes = 0;
         try (Stream<Path> files = Files.list(cacheDirectory)) {
             var iterator = files.iterator();
             while (iterator.hasNext()) {
                 Path file = iterator.next();
-                String fileName = file.getFileName().toString();
-                boolean sourceTemp = GENERATED_SOURCE_TEMP.matcher(fileName).matches();
-                boolean rewriteTemp = GENERATED_REWRITE_TEMP.matcher(fileName).matches()
-                        || GENERATED_ZIP_TEMP.matcher(fileName).matches();
-                if ((!sourceTemp && !rewriteTemp && !GENERATED_CACHE_ARTIFACT.matcher(fileName).matches())
-                        || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) continue;
-                FileTime modified = Files.getLastModifiedTime(file, LinkOption.NOFOLLOW_LINKS);
-                if (sourceTemp || rewriteTemp) {
-                    if (modified.toInstant().isBefore(tempCutoff) && Files.deleteIfExists(file)) removed++;
-                    continue;
-                }
-                if (activeArtifacts.contains(file.toAbsolutePath().normalize())) {
-                    long size = Files.size(file);
-                    activeBytes = Long.MAX_VALUE - activeBytes < size ? Long.MAX_VALUE : activeBytes + size;
-                    continue;
-                }
-                if (modified.toInstant().isBefore(cutoff) && Files.deleteIfExists(file)) removed++;
-                else {
-                    long size = Files.size(file);
-                    inactiveArtifacts.add(new CacheArtifact(file, size, modified));
-                    inactiveBytes = Long.MAX_VALUE - inactiveBytes < size ? Long.MAX_VALUE : inactiveBytes + size;
-                }
+                if (!Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
+                long size = Files.size(file);
+                bytes = Long.MAX_VALUE - bytes < size ? Long.MAX_VALUE : bytes + size;
             }
         }
-        inactiveArtifacts.sort(Comparator.comparing(CacheArtifact::modified)
-                .thenComparing(artifact -> artifact.path().getFileName().toString()));
-        long allowedInactiveBytes = Math.max(0, maxCacheBytes - Math.min(activeBytes, maxCacheBytes));
-        for (CacheArtifact artifact : inactiveArtifacts) {
-            if (inactiveBytes <= allowedInactiveBytes) break;
-            if (Files.deleteIfExists(artifact.path())) {
-                inactiveBytes = Math.max(0, inactiveBytes - artifact.sizeBytes());
-                removed++;
-            }
-        }
-        return new CachePruneResult(removed, activeBytes, inactiveBytes, activeBytes > maxCacheBytes);
+        return new CacheUsage(bytes, bytes > warningThresholdBytes);
     }
 
     List<PreparedVariant> cachedVariants() {
@@ -376,7 +435,16 @@ final class PackVariantManager {
     void clear() {
         cache.clear();
         activeSetFingerprint = "";
+        activePackStackFingerprint = "";
+        activeLinkedPackGroupIndexes = List.of();
+        activeProtectedTexturePaths = Set.of();
+        activeCrossPackTextureDedupAllowed = true;
+        activeVariantIdentitiesSafe = false;
         linkedProfileGroups = List.of();
+    }
+
+    boolean variantIdentitiesSafe() {
+        return activeVariantIdentitiesSafe;
     }
 
     private PreparedVariant remember(String key, PreparedVariant variant) {
@@ -389,6 +457,7 @@ final class PackVariantManager {
         PreparedVariant prepared = cache.get(cacheKey);
         if (prepared != null && prepared.fingerprint().equals(fingerprint) &&
                 (prepared.file() == null || Files.isRegularFile(prepared.file()))) {
+            if (profile != PackProfile.FULL && prepared.audit().getOpaqueBedrockArchivePresent()) return null;
             return prepared;
         }
         if (profile == PackProfile.FULL) return null;
@@ -397,14 +466,18 @@ final class PackVariantManager {
         if (Files.isRegularFile(output)) {
             try {
                 PackAuditReport audit = auditor.audit(output);
+                if (audit.getOpaqueBedrockArchivePresent()) return null;
                 ResourcePack pack = packFactory.apply(output);
                 return remember(cacheKey, new PreparedVariant(fingerprint, profile, pack, output, audit));
-            } catch (Exception | LinkageError invalidCache) {
-                Files.deleteIfExists(output);
+            } catch (Exception | LinkageError ignored) {
+                return null;
             }
         }
         if (isLossless(profile) && Files.isRegularFile(noChangeMarker(output))) {
-            return remember(cacheKey, new PreparedVariant(fingerprint, profile, original, null, sourceAudit(original)));
+            PackAuditReport audit = sourceAudit(original);
+            if (!audit.getOpaqueBedrockArchivePresent()) {
+                return remember(cacheKey, new PreparedVariant(fingerprint, profile, original, null, audit));
+            }
         }
         return null;
     }
@@ -527,15 +600,17 @@ final class PackVariantManager {
         }
     }
 
-    private String packSetFingerprint(List<ResourcePack> packs) throws Exception {
+    private String packSetFingerprint(List<ResourcePack> packs, Map<UUID, String> sourceHashes) throws Exception {
         StringBuilder identity = new StringBuilder();
-        for (ResourcePack pack : packs) identity.append(pack.uuid()).append(':').append(sourceHash(pack)).append('\n');
+        for (ResourcePack pack : packs) identity.append(pack.uuid()).append(':')
+                .append(sourceHashes.getOrDefault(pack.uuid(), "")).append('\n');
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(identity.toString().getBytes(StandardCharsets.UTF_8)));
     }
 
     private String fingerprint(ResourcePack original, PackProfile profile) {
-        String setFingerprint = profile == PackProfile.FULL ? "individual" : activeSetFingerprint;
+        String setFingerprint = profile == PackProfile.FULL ? "individual"
+                : activeSetFingerprint + "-" + activePackStackFingerprint;
         return sourceHash(original) + "-" + REWRITE_REVISION + "-" + setFingerprint + "-" + profile.name();
     }
 
@@ -564,12 +639,54 @@ final class PackVariantManager {
         }
     }
 
+    private Set<String> texturePaths(Path pack) throws IOException {
+        Set<String> paths = new java.util.HashSet<>();
+        try (ZipFile zip = new ZipFile(pack.toFile())) {
+            int scanned = 0;
+            var entries = zip.stream().iterator();
+            while (entries.hasNext()) {
+                ZipEntry entry = entries.next();
+                if (++scanned > PackAuditor.MAX_FILE_COUNT) throw new IOException("Fixed pack exceeds the bounded entry scan");
+                if (entry.isDirectory()) continue;
+                String name = entry.getName().toLowerCase(Locale.ROOT);
+                if (name.endsWith(".png.mcmeta")) {
+                    paths.add(name.substring(0, name.length() - ".mcmeta".length()));
+                } else if (name.endsWith(".png") || name.endsWith(".tga") || name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+                    paths.add(name);
+                }
+            }
+        }
+        return paths;
+    }
+
     private static String shortHash(String value) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(value.getBytes(StandardCharsets.UTF_8)), 0, 12);
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(impossible);
+        }
+    }
+
+    private static UUID variantUuid(ResourcePack original, String fingerprint) {
+        return UUID.nameUUIDFromBytes(("fettle:variant:" + original.uuid() + ":" + fingerprint)
+                .getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static boolean canAssignDistinctVariantIds(List<ResourcePack> stack, Set<UUID> targetIds) {
+        try {
+            for (ResourcePack pack : stack) {
+                var dependencies = pack.manifest().dependencies();
+                if (dependencies == null) return false;
+                for (var dependency : dependencies) {
+                    if (dependency == null || dependency.uuid() == null || targetIds.contains(dependency.uuid())) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        } catch (RuntimeException | LinkageError unverifiedDependencies) {
+            return false;
         }
     }
 
@@ -581,9 +698,6 @@ final class PackVariantManager {
             PackAuditReport audit) {
     }
 
-    record CachePruneResult(int removedArtifacts, long activeBytes, long inactiveBytes, boolean activeExceedsLimit) {
-    }
-
-    private record CacheArtifact(Path path, long sizeBytes, FileTime modified) {
+    record CacheUsage(long bytes, boolean overWarningThreshold) {
     }
 }

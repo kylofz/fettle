@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -46,11 +47,16 @@ class DeviceSelectionPlannerTest {
         PackSetAudit candidates = auditSet(1100 * MIB, 900 * MIB, 420 * MIB, 210 * MIB, 100 * MIB);
         DeviceSelectionPlanner.Plan android = plan(capabilities("ANDROID", 3), candidates, Map.of());
         DeviceSelectionPlanner.Plan windows = plan(capabilities("WINDOWS", 3), candidates, Map.of());
+        DeviceSelectionPlanner.Plan ios = plan(new BedrockDeviceCapabilities(
+                "IOS", 2, "iPhone", 3, 24, 2, true, "1.26.10"), candidates, Map.of());
 
         assertEquals(PackProfile.OPTIMIZE_SEMI, android.selection().profiles().get(PACK_ID));
         assertEquals(android.selection().profiles(), windows.selection().profiles());
+        assertEquals(android.selection().profiles(), ios.selection().profiles());
         assertEquals(android.selection().textureBudgetBytes(), windows.selection().textureBudgetBytes());
+        assertEquals(android.selection().textureBudgetBytes(), ios.selection().textureBudgetBytes());
         assertSame(android.selection(), windows.selection());
+        assertSame(android.selection(), ios.selection());
     }
 
     @Test
@@ -89,44 +95,61 @@ class DeviceSelectionPlannerTest {
         UUID interfacePack = UUID.fromString("00000000-0000-4000-8000-000000000006");
         UUID nonSplit = UUID.fromString("00000000-0000-4000-8000-000000000007");
         Set<UUID> linkedAnimations = Set.of(base, animated, animatedSimple);
-        PackSetAudit nonSplitSet = measuredSet(List.of(nonSplit), nonSplit, Set.of(),
-                1176.8, 1090.8, 318.0, 149.0, 87.9);
+        PackSetAudit nonSplitSet = measuredSet(List.of(nonSplit), nonSplit, Set.of(), Map.of(
+                PackProfile.FULL, auditMiB(1176, 1083),
+                PackProfile.OPTIMIZE_FULL, auditMiB(1116, 1025),
+                PackProfile.OPTIMIZE_SEMI, auditMiB(275, 269),
+                PackProfile.OPTIMIZE_MINI, auditMiB(117, 114),
+                PackProfile.SAFE, auditMiB(58, 57)));
         PackSetAudit splitFullSet = measuredSet(
                 List.of(base, animated, blocks, glyphs, interfacePack), base, linkedAnimations,
-                3813.2, 2391.8, 592.8, 318.6, 242.6);
+                Map.of(
+                        PackProfile.FULL, audit(3_998_452_736L, 3_889_766_400L),
+                        PackProfile.OPTIMIZE_FULL, audit(2_680_668_668L, 2_473_299_780L),
+                        PackProfile.OPTIMIZE_SEMI, audit(311_454_804L, 285_215_696L),
+                        PackProfile.OPTIMIZE_MINI, audit(152_976_360L, 137_954_156L),
+                        PackProfile.SAFE, audit(111_395_280L, 99_995_852L)));
         PackSetAudit splitSimpleSet = measuredSet(
                 List.of(base, animatedSimple, blocks, glyphs, interfacePack), base, linkedAnimations,
-                6255.1, 2118.1, 951.7, 406.0, 248.4);
+                Map.of(
+                        PackProfile.FULL, audit(6_558_907_392L, 6_450_221_056L),
+                        PackProfile.OPTIMIZE_FULL, audit(2_288_402_984L, 1_911_730_548L),
+                        PackProfile.OPTIMIZE_SEMI, audit(260_351_632L, 222_018_384L),
+                        PackProfile.OPTIMIZE_MINI, audit(139_722_168L, 121_953_276L),
+                        PackProfile.SAFE, audit(107_606_884L, 95_554_692L)));
 
         assertAutomaticProfiles(nonSplitSet, List.of(nonSplit), new PackProfile[]{
                 PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI,
-                PackProfile.OPTIMIZE_SEMI, PackProfile.OPTIMIZE_FULL});
+                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI});
         assertAutomaticProfiles(splitFullSet, List.of(base, animated), new PackProfile[]{
                 PackProfile.SAFE, PackProfile.SAFE, PackProfile.SAFE,
-                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_SEMI});
+                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI});
         assertAutomaticProfiles(splitSimpleSet, List.of(base, animatedSimple), new PackProfile[]{
-                PackProfile.SAFE, PackProfile.SAFE, PackProfile.SAFE,
+                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI,
                 PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_SEMI});
+        assertUnknownIosProfile(splitFullSet, List.of(base, animated), PackProfile.SAFE);
+        assertUnknownIosProfile(splitSimpleSet, List.of(base, animatedSimple), PackProfile.OPTIMIZE_MINI);
     }
 
     private static PackSetAudit measuredSet(
             List<UUID> packIds,
             UUID aggregatePack,
             Set<UUID> linkedGroup,
-            double full,
-            double lossless,
-            double semi,
-            double mini,
-            double safe) {
-        // These are whole-set totals; the linked base carries the aggregate cost in this planner-only fixture.
+            Map<PackProfile, PackAuditReport> aggregateReports) {
+        // Whole-set costs are carried by the linked base so the fixture tests real atlas limits.
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = new HashMap<>();
         for (UUID id : packIds) {
             variants.put(id, id.equals(aggregatePack)
-                    ? measured(full, lossless, semi, mini, safe)
-                    : measured(0, 0, 0, 0, 0));
+                    ? aggregateReports
+                    : Map.of(
+                            PackProfile.FULL, audit(0, 0),
+                            PackProfile.OPTIMIZE_FULL, audit(0, 0),
+                            PackProfile.OPTIMIZE_SEMI, audit(0, 0),
+                            PackProfile.OPTIMIZE_MINI, audit(0, 0),
+                            PackProfile.SAFE, audit(0, 0)));
         }
-        return new PackSetAudit(List.of(), List.of(), List.of(), Map.of(), variants,
-                linkedGroup.isEmpty() ? List.of() : List.of(linkedGroup), 0, 0, 0, true, true);
+        return new PackSetAudit(List.of(), List.of(), List.of(), Map.of(), variants, Map.of(),
+                linkedGroup.isEmpty() ? List.of() : List.of(linkedGroup), 0, 0, 0, 0, true, 0, true, true);
     }
 
     private static void assertAutomaticProfiles(
@@ -141,8 +164,25 @@ class DeviceSelectionPlannerTest {
                 assertEquals(expectedByTier[tier], selection.profiles().get(packId),
                         "MemoryTier " + tier + " pack " + packId);
             }
+            assertTrue(selection.atlasMetricsComplete(), "atlas metrics for MemoryTier " + tier);
+            assertTrue(selection.withinStackAtlasPolicy(), "stack atlas policy for MemoryTier " + tier);
             assertTrue(selection.withinBudget(), "MemoryTier " + tier);
         }
+    }
+
+    private static void assertUnknownIosProfile(
+            PackSetAudit candidates,
+            List<UUID> linkedPacks,
+            PackProfile expected) {
+        var selection = plan(new BedrockDeviceCapabilities("IOS", 2, "iPhone", null,
+                null, null, null, "1.26.52"), candidates, Map.of()).selection();
+
+        assertEquals(300 * MIB, selection.textureBudgetBytes());
+        assertFalse(selection.budgetKnown());
+        assertFalse(selection.withinBudget());
+        assertTrue(selection.atlasMetricsComplete());
+        assertTrue(selection.withinStackAtlasPolicy());
+        linkedPacks.forEach(id -> assertEquals(expected, selection.profiles().get(id)));
     }
 
     @Test
@@ -151,14 +191,48 @@ class DeviceSelectionPlannerTest {
                 capabilities("NINTENDO", 2),
                 auditSet(1100 * MIB, 900 * MIB, 420 * MIB, 210 * MIB, 100 * MIB),
                 Map.of());
-        SessionDeviceSnapshot snapshot = plan.snapshot(Map.of(PACK_ID, PackProfile.OPTIMIZE_MINI), "SIMPLE");
+        SessionDeviceSnapshot snapshot = plan.snapshot(Map.of(PACK_ID, PackProfile.OPTIMIZE_MINI), "SIMPLE", 1234);
 
+        assertEquals(1234, snapshot.geyserProtocolVersion());
         assertEquals(2, snapshot.selectionMemoryTier());
         assertEquals(PackProfile.OPTIMIZE_MINI, snapshot.selectedProfiles().get(PACK_ID));
         assertEquals(210 * MIB, snapshot.estimatedTextureBytes());
         assertEquals("SIMPLE", snapshot.scaffoldingAnimationVariant());
         assertTrue(snapshot.defaultTierBudget());
         assertTrue(snapshot.withinBudget());
+    }
+
+    @Test
+    void snapshotIncludesPerPackAuditsForIncompleteTargetAndFixedPacks() {
+        UUID fixedId = UUID.fromString("d64da2bc-9df9-4d1a-975c-32f472350d71");
+        PackAuditReport incomplete = new PackAuditReport(
+                0, 0, 1, 0, 2, 80 * MIB,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                17, 1520, "models/entity/heavy.geo.json",
+                false, true, true, 1, 0, List.of("one texture could not be measured"));
+        PackAuditReport fixed = audit(150 * MIB);
+        PackSetAudit candidates = new PackSetAudit(
+                List.of(), List.of(), List.of(), Map.of(),
+                Map.of(PACK_ID, Map.of(PackProfile.FULL, incomplete)),
+                Map.of(fixedId, fixed), List.of(),
+                150 * MIB, 1, 0, 0, true, 0, true, true);
+
+        SessionDeviceSnapshot snapshot = plan(capabilities("IOS", 3), candidates, Map.of())
+                .snapshot(Map.of(PACK_ID, PackProfile.FULL), null, 1234);
+
+        assertEquals(2, snapshot.packAudits().size());
+        PackSetAudit.PackAuditSnapshot target = snapshot.packAudits().stream()
+                .filter(pack -> pack.id().equals(PACK_ID)).findFirst().orElseThrow();
+        assertEquals(PackProfile.FULL, target.profile());
+        assertEquals(1, target.report().getUnmeasuredTextureCount());
+        assertEquals(17, target.report().getModelFileCount());
+        assertEquals(1520, target.report().getMaxModelCubes());
+        assertEquals("models/entity/heavy.geo.json", target.report().getLargestModelPath());
+        PackSetAudit.PackAuditSnapshot fixedPack = snapshot.packAudits().stream()
+                .filter(pack -> pack.id().equals(fixedId)).findFirst().orElseThrow();
+        assertEquals(PackProfile.FULL, fixedPack.profile());
+        assertEquals(fixed, fixedPack.report());
     }
 
     private static DeviceSelectionPlanner.Plan plan(
@@ -179,30 +253,24 @@ class DeviceSelectionPlannerTest {
                 PackProfile.OPTIMIZE_SEMI, audit(semi),
                 PackProfile.OPTIMIZE_MINI, audit(mini),
                 PackProfile.SAFE, audit(safe));
-        return new PackSetAudit(List.of(), List.of(), List.of(), Map.of(), Map.of(PACK_ID, variants), List.of(),
-                0, 0, 0, true, true);
+        return new PackSetAudit(List.of(), List.of(), List.of(), Map.of(), Map.of(PACK_ID, variants), Map.of(), List.of(),
+                0, 0, 0, 0, true, 0, true, true);
     }
 
     private static PackAuditReport audit(long textureBytes) {
+        return audit(textureBytes, 0);
+    }
+
+    private static PackAuditReport audit(long textureBytes, long itemAtlasTextureBytes) {
         return new PackAuditReport(
                 0, 0, 1, 0, 1, textureBytes,
                 null, 0, 0, 0,
                 null, 0, 0, 0,
                 0, 0, null,
-                true, true, true, 0, 0, List.of());
+                true, true, true, 0, 0, List.of(), List.of(), 0, 0, 0, itemAtlasTextureBytes);
     }
 
-    private static Map<PackProfile, PackAuditReport> measured(
-            double full, double lossless, double semi, double mini, double safe) {
-        return Map.of(
-                PackProfile.FULL, auditMiB(full),
-                PackProfile.OPTIMIZE_FULL, auditMiB(lossless),
-                PackProfile.OPTIMIZE_SEMI, auditMiB(semi),
-                PackProfile.OPTIMIZE_MINI, auditMiB(mini),
-                PackProfile.SAFE, auditMiB(safe));
-    }
-
-    private static PackAuditReport auditMiB(double textureMemoryMiB) {
-        return audit(Math.round(textureMemoryMiB * MIB));
+    private static PackAuditReport auditMiB(double textureMemoryMiB, double itemAtlasTextureMemoryMiB) {
+        return audit(Math.round(textureMemoryMiB * MIB), Math.round(itemAtlasTextureMemoryMiB * MIB));
     }
 }

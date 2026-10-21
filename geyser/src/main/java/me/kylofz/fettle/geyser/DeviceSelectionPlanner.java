@@ -44,7 +44,9 @@ final class DeviceSelectionPlanner {
                 || playerOverride == null && configuredProfile == PackProfile.AUTO;
         SelectionKey key = new SelectionKey(memoryTier, configuredProfile, playerOverride, Map.copyOf(budgets),
                 packSetAudit.variantReports(), packSetAudit.fixedTextureMemoryBytes(),
-                packSetAudit.fixedTextureFileCount(), packSetAudit.fixedMetricsComplete(),
+                packSetAudit.fixedTextureFileCount(), packSetAudit.fixedItemAtlasTextureMemoryBytes(),
+                packSetAudit.fixedBlockAtlasTextureMemoryBytes(), packSetAudit.fixedAtlasMetricsComplete(),
+                packSetAudit.fixedMetricsComplete(),
                 packSetAudit.linkedProfileGroups());
         DeviceProfilePolicy.Selection selection;
         synchronized (selections) {
@@ -59,7 +61,10 @@ final class DeviceSelectionPlanner {
                         packSetAudit.fixedTextureMemoryBytes(),
                         packSetAudit.fixedTextureFileCount(),
                         packSetAudit.fixedMetricsComplete(),
-                        packSetAudit.linkedProfileGroups());
+                        packSetAudit.linkedProfileGroups(),
+                        packSetAudit.fixedItemAtlasTextureMemoryBytes(),
+                        packSetAudit.fixedBlockAtlasTextureMemoryBytes(),
+                        packSetAudit.fixedAtlasMetricsComplete());
                 selections.put(key, selection);
             }
         }
@@ -75,6 +80,9 @@ final class DeviceSelectionPlanner {
             Map<UUID, Map<PackProfile, PackAuditReport>> variants,
             long fixedTextureMemoryBytes,
             long fixedTextureFileCount,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
             boolean fixedMetricsComplete,
             List<Set<UUID>> linkedProfileGroups) {
     }
@@ -91,7 +99,10 @@ final class DeviceSelectionPlanner {
             DeviceProfilePolicy.Selection selection,
             boolean defaultTierBudget) {
 
-        SessionDeviceSnapshot snapshot(Map<UUID, PackProfile> selectedProfiles, String scaffoldingAnimation) {
+        SessionDeviceSnapshot snapshot(
+                Map<UUID, PackProfile> selectedProfiles,
+                String scaffoldingAnimation,
+                int geyserProtocolVersion) {
             DeviceProfilePolicy.Selection delivered = DeviceProfilePolicy.summarize(
                     selectedProfiles,
                     packSetAudit.variantReports(),
@@ -99,7 +110,10 @@ final class DeviceSelectionPlanner {
                     packSetAudit.fixedTextureMemoryBytes(),
                     packSetAudit.fixedTextureFileCount(),
                     packSetAudit.fixedMetricsComplete(),
-                    selection.budgetKnown());
+                    selection.budgetKnown(),
+                    packSetAudit.fixedItemAtlasTextureMemoryBytes(),
+                    packSetAudit.fixedBlockAtlasTextureMemoryBytes(),
+                    packSetAudit.fixedAtlasMetricsComplete());
             DeviceProfilePolicy.TextureHandleEstimate handles = DeviceProfilePolicy.estimateTextureHandles(
                     selectedProfiles,
                     packSetAudit.variantReports(),
@@ -107,17 +121,24 @@ final class DeviceSelectionPlanner {
                     packSetAudit.fixedHandleMetricsComplete());
             return new SessionDeviceSnapshot(
                     capabilities,
+                    geyserProtocolVersion,
                     selectionMemoryTier,
                     scaffoldingAnimation,
                     selectedProfiles,
+                    packSetAudit.selectedPackAudits(selectedProfiles),
                     delivered.textureBudgetBytes(),
                     delivered.estimatedTextureBytes(),
                     delivered.estimatedTextureFileCount(),
+                    delivered.estimatedResourceMemoryBytes(),
+                    delivered.estimatedItemAtlasTextureBytes(),
+                    delivered.estimatedBlockAtlasTextureBytes(),
                     handles.upperBound(),
                     delivered.metricsComplete(),
                     handles.complete(),
                     delivered.budgetKnown(),
                     delivered.withinBudget(),
+                    delivered.atlasMetricsComplete(),
+                    delivered.withinStackAtlasPolicy(),
                     defaultTierBudget);
         }
     }

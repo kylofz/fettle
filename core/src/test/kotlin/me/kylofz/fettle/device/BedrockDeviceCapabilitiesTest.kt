@@ -4,7 +4,9 @@ import java.nio.charset.StandardCharsets
 import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class BedrockDeviceCapabilitiesTest {
     @Test
@@ -24,12 +26,29 @@ class BedrockDeviceCapabilitiesTest {
         assertEquals(76, capabilities.maxViewDistance)
         assertEquals(2, capabilities.graphicsMode)
         assertEquals(true, capabilities.compatibleWithClientSideChunkGen)
+        assertTrue(capabilities.clientDataDecoded)
+        assertTrue(capabilities.memoryTierClaimPresent)
+        assertEquals(MemoryTierClaimStatus.VALID, capabilities.memoryTierClaimStatus)
+    }
+
+    @Test
+    fun distinguishesDecodedIosDataFromAnUnusableMemoryTier() {
+        val capabilities = BedrockDeviceCapabilities.fromGeyserClientDataJwt(
+            jwt("""{"DeviceOS":2,"DeviceModel":"iPhone"}"""),
+            "IOS",
+        )
+
+        assertTrue(capabilities.clientDataDecoded)
+        assertEquals(MemoryTierClaimStatus.MISSING, capabilities.memoryTierClaimStatus)
+        assertNull(capabilities.memoryTier)
     }
 
     @Test
     fun rejectsMalformedJwtAndOutOfRangeOrFractionalClaims() {
         val malformed = BedrockDeviceCapabilities.fromGeyserClientDataJwt("not-a-jwt", "WINDOWS")
         assertEquals("WINDOWS", malformed.platform)
+        assertFalse(malformed.clientDataDecoded)
+        assertEquals(MemoryTierClaimStatus.UNDECODABLE, malformed.memoryTierClaimStatus)
         assertNull(malformed.memoryTier)
 
         val capabilities = BedrockDeviceCapabilities.fromGeyserClientDataJwt(
@@ -38,9 +57,12 @@ class BedrockDeviceCapabilitiesTest {
         )
         assertNull(capabilities.deviceOs)
         assertNull(capabilities.memoryTier)
+        assertTrue(capabilities.memoryTierClaimPresent)
+        assertEquals(MemoryTierClaimStatus.INVALID, capabilities.memoryTierClaimStatus)
         assertNull(capabilities.maxViewDistance)
         assertNull(capabilities.graphicsMode)
         assertNull(capabilities.compatibleWithClientSideChunkGen)
+        assertTrue(capabilities.clientDataDecoded)
     }
 
     @Test
@@ -51,6 +73,7 @@ class BedrockDeviceCapabilitiesTest {
         )
 
         assertEquals("ANDROID", capabilities.platform)
+        assertEquals(MemoryTierClaimStatus.UNDECODABLE, capabilities.memoryTierClaimStatus)
         assertNull(capabilities.memoryTier)
     }
 
@@ -63,11 +86,11 @@ class BedrockDeviceCapabilitiesTest {
 
         assertEquals(
             listOf(
-                "SuperLow (up to 1.5 GB)",
-                "Low (up to 2 GB)",
-                "Mid (up to 4 GB)",
-                "High (up to 8 GB)",
-                "SuperHigh (over 8 GB)",
+                "SuperLow (roughly <1.5 GB RAM)",
+                "Low (roughly <2 GB RAM)",
+                "Mid (roughly <4 GB RAM)",
+                "High (roughly <8 GB RAM)",
+                "SuperHigh (roughly >8 GB RAM)",
             ),
             descriptions,
         )
@@ -82,6 +105,8 @@ class BedrockDeviceCapabilitiesTest {
         assertEquals(7, capabilities.deviceOs)
         assertEquals("Pixel 8", capabilities.deviceModel)
         assertEquals("1.26.10", capabilities.gameVersion)
+        assertFalse(capabilities.clientDataDecoded)
+        assertEquals(MemoryTierClaimStatus.UNDECODABLE, capabilities.memoryTierClaimStatus)
         assertNull(capabilities.memoryTier)
     }
 

@@ -12,7 +12,13 @@ final class GeyserDeviceCapabilitiesReader {
             platform = connection.platform().name();
         } catch (RuntimeException ignored) {
         }
-        return readClientData(connection, platform);
+        BedrockDeviceCapabilities capabilities = readClientData(connection, platform);
+        if (capabilities.getGameVersion() != null) return capabilities;
+        try {
+            return capabilities.withGeyserParsedIdentity(null, null, connection.version());
+        } catch (RuntimeException | LinkageError ignored) {
+            return capabilities;
+        }
     }
 
     BedrockDeviceCapabilities readClientData(Object connection, String platform) {
@@ -23,6 +29,8 @@ final class GeyserDeviceCapabilitiesReader {
         // Geyser's BedrockClientData adapter maps DeviceOS IDs to enum ordinals.
         Integer deviceOsOrdinal = deviceOs instanceof Enum<?> value && value.ordinal() > 0
                 ? value.ordinal() : null;
+        String deviceOsLabel = deviceOs instanceof Enum<?> value && value.ordinal() > 0
+                ? value.toString() : null;
         Object deviceModel = invokeNoArgs(clientData, "getDeviceModel");
         Object gameVersion = invokeNoArgs(clientData, "getGameVersion");
         return BedrockDeviceCapabilities.fromGeyserClientDataJwt(
@@ -30,7 +38,8 @@ final class GeyserDeviceCapabilitiesReader {
                 platform).withGeyserParsedIdentity(
                 deviceOsOrdinal,
                 deviceModel instanceof String value ? value : null,
-                gameVersion instanceof String value ? value : null);
+                gameVersion instanceof String value ? value : null,
+                deviceOsLabel);
     }
 
     private Object invokeNoArgs(Object target, String methodName) {

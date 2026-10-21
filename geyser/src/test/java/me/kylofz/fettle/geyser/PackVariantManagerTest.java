@@ -2,6 +2,7 @@ package me.kylofz.fettle.geyser;
 
 import org.geysermc.geyser.api.pack.PackCodec;
 import org.geysermc.geyser.api.pack.ResourcePack;
+import org.geysermc.geyser.api.pack.ResourcePackManifest;
 import me.kylofz.fettle.optimizer.PackAuditReport;
 import me.kylofz.fettle.optimizer.PackOptimizationReport;
 import org.junit.jupiter.api.Test;
@@ -20,10 +21,7 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -34,6 +32,7 @@ import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -91,6 +90,30 @@ class PackVariantManagerTest {
     }
 
     @Test
+    void doesNotBuildOrReuseVariantsForOpaqueBedrockArchives() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("archived.mcpack");
+        writeEntries(sourcePath, Map.of(
+                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "__brarchive/textures.brarchive", new byte[]{0x42, 0x52, 0x41, 0x52}));
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        Path cacheDirectory = temporaryDirectory.resolve("opaque-pack-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared =
+                manager.prepareSet(List.of(source), PackVariantManager.PREWARM_PROFILES);
+        PackVariantManager.PreparedVariant safe = manager.prepare(source, PackProfile.SAFE);
+
+        assertEquals(java.util.Set.of(PackProfile.FULL), prepared.get(packId).keySet());
+        assertTrue(prepared.get(packId).get(PackProfile.FULL).audit().getOpaqueBedrockArchivePresent());
+        assertSame(source, safe.pack());
+        assertNull(safe.file());
+        try (Stream<Path> files = Files.list(cacheDirectory)) {
+            assertEquals(0L, files.count());
+        }
+    }
+
+    @Test
     void preparesAndCachesLinkedLosslessPackVariantsTogether() throws Exception {
         UUID baseId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         UUID overlayId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
@@ -112,13 +135,13 @@ class PackVariantManagerTest {
                 + "\"enchanted\":\"textures/misc/glint\"},"
                 + "\"materials\":{\"default\":\"entity_alphatest\",\"enchanted\":\"entity_alphatest_glint\"}}}}";
         writeEntries(basePath, Map.of(
-                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "manifest.json", manifest(baseId),
                 "attachables/base-reference.json", "{\"geometry\":{\"default\":\"geometry.scf.shared\"},"
                         .concat("\"textures\":{\"default\":\"textures/stitched/default\"}}")
                         .getBytes(StandardCharsets.UTF_8),
                 "models/entity/shared.geo.json", geometry.getBytes(StandardCharsets.UTF_8)));
         writeEntries(overlayPath, Map.of(
-                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "manifest.json", manifest(overlayId),
                 "attachables/frames.json", attachable.getBytes(StandardCharsets.UTF_8),
                 "textures/stitched/default.png", image,
                 "textures/stitched/frame_0.png", image,
@@ -139,9 +162,17 @@ class PackVariantManagerTest {
         assertEquals(List.of(java.util.Set.of(baseId, overlayId)), manager.linkedProfileGroups());
         Path baseVariant = prepared.get(baseId).get(PackProfile.OPTIMIZE_FULL).file();
         Path overlayVariant = prepared.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file();
+        UUID generatedBaseId = prepared.get(baseId).get(PackProfile.OPTIMIZE_FULL).pack().uuid();
+        UUID generatedOverlayId = prepared.get(overlayId).get(PackProfile.OPTIMIZE_FULL).pack().uuid();
         assertNotNull(baseVariant);
         assertNotNull(overlayVariant);
+        assertFalse(baseId.equals(generatedBaseId));
+        assertFalse(overlayId.equals(generatedOverlayId));
+        assertFalse(generatedBaseId.equals(generatedOverlayId));
         try (ZipFile zip = new ZipFile(baseVariant.toFile())) {
+            String manifest = new String(zip.getInputStream(zip.getEntry("manifest.json")).readAllBytes(),
+                    StandardCharsets.UTF_8);
+            assertTrue(manifest.contains("\"uuid\":\"" + generatedBaseId + "\""));
             String rewritten = new String(zip.getInputStream(zip.getEntry("models/entity/shared.geo.json")).readAllBytes(),
                     StandardCharsets.UTF_8);
             assertTrue(rewritten.contains("\"texture_width\":602"));
@@ -149,6 +180,9 @@ class PackVariantManagerTest {
             assertTrue(zip.stream().anyMatch(entry -> entry.getName().startsWith("textures/entity/fettle/atlases/")));
         }
         try (ZipFile zip = new ZipFile(overlayVariant.toFile())) {
+            String manifest = new String(zip.getInputStream(zip.getEntry("manifest.json")).readAllBytes(),
+                    StandardCharsets.UTF_8);
+            assertTrue(manifest.contains("\"uuid\":\"" + generatedOverlayId + "\""));
             assertNull(zip.getEntry("textures/stitched/default.png"));
             assertNull(zip.getEntry("textures/stitched/frame_0.png"));
             assertNull(zip.getEntry("textures/stitched/frame_1.png"));
@@ -163,6 +197,8 @@ class PackVariantManagerTest {
         for (int index = 0; index < limits.length; index++) {
             int limit = limits[index];
             PackProfile profile = resizedProfiles[index];
+            assertTrue(prepared.get(baseId).get(profile).audit().getTextureMetricsComplete());
+            assertTrue(prepared.get(overlayId).get(profile).audit().getTextureMetricsComplete());
             Path baseProfile = prepared.get(baseId).get(profile).file();
             Path overlayProfile = prepared.get(overlayId).get(profile).file();
             try (ZipFile zip = new ZipFile(baseProfile.toFile())) {
@@ -194,6 +230,145 @@ class PackVariantManagerTest {
                 restarted.prepareSet(List.of(base, overlay), profiles);
         assertEquals(baseVariant, reused.get(baseId).get(PackProfile.OPTIMIZE_FULL).file());
         assertEquals(overlayVariant, reused.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file());
+        assertTrue(restarted.matchesPreparedSet(List.of(base, overlay)));
+        PackSetAudit perSessionSubset = PackSetAudit.forSession(
+                null, List.of(base), pack -> pack.uuid().equals(baseId), restarted);
+        assertFalse(perSessionSubset.preparedPackStackMatches());
+        assertEquals(java.util.Set.of(PackProfile.FULL), perSessionSubset.variantReports().get(baseId).keySet());
+
+        Path partialCacheDirectory = temporaryDirectory.resolve("partial-linked-cache");
+        PackVariantManager cacheWriter = new PackVariantManager(partialCacheDirectory, factory);
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> losslessOnly =
+                cacheWriter.prepareSet(List.of(base, overlay), List.of(PackProfile.OPTIMIZE_FULL));
+        Path partialBaseLossless = losslessOnly.get(baseId).get(PackProfile.OPTIMIZE_FULL).file();
+        Path partialOverlayLossless = losslessOnly.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file();
+        byte[] retainedBaseBytes = Files.readAllBytes(partialBaseLossless);
+        Files.delete(partialOverlayLossless);
+
+        PackVariantManager partialRecovery = new PackVariantManager(partialCacheDirectory, factory);
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> recoveredLossless =
+                partialRecovery.prepareSet(List.of(base, overlay), List.of(PackProfile.OPTIMIZE_FULL));
+        assertArrayEquals(retainedBaseBytes, Files.readAllBytes(partialBaseLossless));
+        assertTrue(Files.isRegularFile(recoveredLossless.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file()));
+
+        Files.delete(recoveredLossless.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file());
+        PackVariantManager partialResizer = new PackVariantManager(partialCacheDirectory, factory);
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> resizedFromPartialCache =
+                partialResizer.prepareSet(List.of(base, overlay), List.of(PackProfile.OPTIMIZE_SEMI));
+        Path cleanCacheDirectory = temporaryDirectory.resolve("clean-linked-cache");
+        PackVariantManager cleanResizer = new PackVariantManager(cleanCacheDirectory, factory);
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> resizedFromOriginals =
+                cleanResizer.prepareSet(List.of(base, overlay), List.of(PackProfile.OPTIMIZE_SEMI));
+        assertArrayEquals(
+                Files.readAllBytes(resizedFromOriginals.get(baseId).get(PackProfile.OPTIMIZE_SEMI).file()),
+                Files.readAllBytes(resizedFromPartialCache.get(baseId).get(PackProfile.OPTIMIZE_SEMI).file()));
+        assertArrayEquals(
+                Files.readAllBytes(resizedFromOriginals.get(overlayId).get(PackProfile.OPTIMIZE_SEMI).file()),
+                Files.readAllBytes(resizedFromPartialCache.get(overlayId).get(PackProfile.OPTIMIZE_SEMI).file()));
+    }
+
+    @Test
+    void protectsSharedTexturePathsAndCacheAgainstTheFullRequiredPackStack() throws Exception {
+        UUID baseId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        UUID overlayId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
+        UUID fixedId = UUID.fromString("4d4de4ff-cf09-6f80-b4f6-3c99622b1d0f");
+        Path basePath = temporaryDirectory.resolve("stack-base.mcpack");
+        Path overlayPath = temporaryDirectory.resolve("stack-overlay.mcpack");
+        Path fixedPath = temporaryDirectory.resolve("stack-fixed.mcpack");
+        BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < image.getHeight(); y++) for (int x = 0; x < image.getWidth(); x++) {
+            image.setRGB(x, y, 0xff345678);
+        }
+        ByteArrayOutputStream png = new ByteArrayOutputStream();
+        ImageIO.write(image, "png", png);
+        byte[] identicalTexture = png.toByteArray();
+        String model = "{\"minecraft:geometry\":[{\"description\":{\"identifier\":\"geometry.scf.shared\"}}]}";
+        String baseAttachable = "{\"minecraft:attachable\":{\"description\":{\"geometry\":{\"default\":\"geometry.scf.shared\"},"
+                + "\"textures\":{\"default\":\"textures/model/base\"}}}}";
+        String overlayAttachable = "{\"minecraft:attachable\":{\"description\":{\"geometry\":{\"default\":\"geometry.scf.shared\"},"
+                + "\"textures\":{\"default\":\"textures/model/frame\"}}}}";
+        writeEntries(basePath, Map.of(
+                "manifest.json", manifest(baseId),
+                "models/entity/shared.geo.json", model.getBytes(StandardCharsets.UTF_8),
+                "attachables/base.json", baseAttachable.getBytes(StandardCharsets.UTF_8),
+                "textures/model/base.png", identicalTexture));
+        writeEntries(overlayPath, Map.of(
+                "manifest.json", manifest(overlayId),
+                "attachables/overlay.json", overlayAttachable.getBytes(StandardCharsets.UTF_8),
+                "textures/model/frame.png", identicalTexture));
+        writeEntries(fixedPath, Map.of(
+                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "textures/model/base.png", new byte[]{1, 2, 3, 4}));
+
+        ResourcePack base = filePack(basePath, baseId);
+        ResourcePack overlay = filePack(overlayPath, overlayId);
+        ResourcePack fixed = filePack(fixedPath, fixedId);
+        java.util.function.Function<Path, ResourcePack> factory = path -> filePack(
+                path, path.getFileName().toString().startsWith(baseId.toString()) ? baseId : overlayId);
+        PackVariantManager manager = new PackVariantManager(
+                temporaryDirectory.resolve("full-stack-cache"), factory);
+
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> variants = manager.prepareSet(
+                List.of(base, overlay), List.of(base, overlay, fixed),
+                List.of(PackProfile.FULL, PackProfile.OPTIMIZE_FULL));
+
+        Path overlayVariant = variants.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file();
+        try (ZipFile zip = new ZipFile(overlayVariant.toFile())) {
+            assertTrue(zip.getEntry("textures/model/frame.png") != null);
+            String attachable = new String(zip.getInputStream(zip.getEntry("attachables/overlay.json")).readAllBytes(),
+                    StandardCharsets.UTF_8);
+            assertTrue(attachable.contains("textures/model/frame"));
+        }
+        assertTrue(manager.matchesPreparedSet(List.of(base, overlay, fixed), List.of(base, overlay)));
+
+        writeEntries(fixedPath, Map.of(
+                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "attachables/consumer.json", "{\"textures\":{\"default\":\"textures/model/frame\"}}"
+                        .getBytes(StandardCharsets.UTF_8)));
+        ResourcePack referencingFixed = filePack(fixedPath, fixedId);
+        PackVariantManager referenceGuard = new PackVariantManager(
+                temporaryDirectory.resolve("full-stack-reference-cache"), factory);
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> referencedVariants = referenceGuard.prepareSet(
+                List.of(base, overlay), List.of(base, overlay, referencingFixed),
+                List.of(PackProfile.FULL, PackProfile.OPTIMIZE_FULL));
+        try (ZipFile zip = new ZipFile(referencedVariants.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file().toFile())) {
+            assertTrue(zip.getEntry("textures/model/frame.png") != null);
+        }
+
+        assertNotNull(referenceGuard.preparedVariantIfCached(base, PackProfile.OPTIMIZE_FULL));
+        writeEntries(fixedPath, Map.of(
+                "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
+                "textures/model/other.png", new byte[]{9, 8, 7, 6}));
+        ResourcePack changedFixed = filePack(fixedPath, fixedId);
+        PackSetAudit changedStack = PackSetAudit.forSession(
+                null, List.of(base, overlay, changedFixed), pack -> pack.uuid().equals(baseId)
+                        || pack.uuid().equals(overlayId), referenceGuard);
+        assertFalse(changedStack.preparedPackStackMatches());
+        assertNull(changedStack.preparedVariant(base, PackProfile.OPTIMIZE_FULL, referenceGuard));
+        assertEquals(java.util.Set.of(PackProfile.FULL),
+                changedStack.variantReports().get(baseId).keySet());
+    }
+
+    @Test
+    void keepsRequiredPackIdentityWhenAnotherRequiredPackDependsOnIt() throws Exception {
+        UUID targetId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        UUID dependentId = UUID.fromString("4d4de4ff-cf09-6f80-b4f6-3c99622b1d0f");
+        Path targetPath = temporaryDirectory.resolve("dependency-target.mcpack");
+        Path dependentPath = temporaryDirectory.resolve("dependency-consumer.mcpack");
+        writeEntries(targetPath, Map.of("manifest.json", manifest(targetId), "textures/test.png", new byte[]{1, 2, 3}));
+        writeEntries(dependentPath, Map.of("manifest.json", manifest(dependentId)));
+        ResourcePack target = filePack(targetPath, targetId);
+        ResourcePack dependent = filePack(dependentPath, dependentId, List.of(targetId));
+        PackVariantManager manager = new PackVariantManager(
+                temporaryDirectory.resolve("dependency-cache"), path -> filePack(path, targetId));
+
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared = manager.prepareSet(
+                List.of(target), List.of(target, dependent), List.of(PackProfile.FULL, PackProfile.OPTIMIZE_FULL));
+
+        assertFalse(manager.variantIdentitiesSafe());
+        assertEquals(java.util.Set.of(PackProfile.FULL), prepared.get(targetId).keySet());
+        assertSame(target, prepared.get(targetId).get(PackProfile.FULL).pack());
+        assertNull(manager.preparedVariantIfCached(target, PackProfile.OPTIMIZE_FULL));
     }
 
     @Test
@@ -278,100 +453,45 @@ class PackVariantManagerTest {
     }
 
     @Test
-    void prunesOnlyExpiredGeneratedArtifactsOutsideTheActivePackSet() throws Exception {
-        Path sourcePath = temporaryDirectory.resolve("source.mcpack");
-        writePack(sourcePath);
-        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
-        ResourcePack source = filePack(sourcePath, packId);
-        Path cacheDirectory = temporaryDirectory.resolve("pruned-cache");
-        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
-        Path activeVariant = manager.prepare(source, PackProfile.SAFE).file();
-        String artifactPrefix = activeVariant.getFileName().toString().substring(0, 37);
-        Instant expired = Instant.now().minus(Duration.ofDays(31));
+    void reportsPackCacheSizeWithoutDeletingFiles() throws Exception {
+        Path cacheDirectory = temporaryDirectory.resolve("pack-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory);
+        Path oldVariant = cacheDirectory.resolve("old-variant.mcpack");
+        Path interruptedWrite = cacheDirectory.resolve(".fettle-raw-interrupted.tmp");
+        Path operatorFile = cacheDirectory.resolve("operator-note.txt");
+        Files.write(oldVariant, new byte[3]);
+        Files.write(interruptedWrite, new byte[5]);
+        Files.write(operatorFile, new byte[7]);
 
-        Path staleVariant = cacheDirectory.resolve(artifactPrefix + "a".repeat(12) + "b".repeat(12) + "-safe.mcpack");
-        Path recentVariant = cacheDirectory.resolve(artifactPrefix + "c".repeat(12) + "d".repeat(12) + "-safe.mcpack");
-        Path staleNoChange = cacheDirectory.resolve(artifactPrefix + "e".repeat(12) + "f".repeat(12)
-                + "-optimize_full.mcpack.no-change");
-        Path unrelated = cacheDirectory.resolve("notes.mcpack");
-        Path staleRawTemp = cacheDirectory.resolve(".fettle-raw-orphan123.tmp");
-        Path staleDeflateTemp = cacheDirectory.resolve(".fettle-deflate-orphan123.tmp");
-        Path staleRewriteTemp = cacheDirectory.resolve("." + activeVariant.getFileName() + "orphan123.tmp");
-        Path recentRawTemp = cacheDirectory.resolve(".fettle-raw-current123.tmp");
-        Path interruptedSource = Files.createTempFile(cacheDirectory, "." + packId + "-", ".source.mcpack");
-        Path recentSource = Files.createTempFile(cacheDirectory, "." + packId + "-", ".source.mcpack");
-        Files.copy(activeVariant, staleVariant);
-        Files.copy(activeVariant, recentVariant);
-        Files.write(staleNoChange, new byte[0]);
-        Files.write(unrelated, new byte[0]);
-        Files.write(staleRawTemp, new byte[0]);
-        Files.write(staleDeflateTemp, new byte[0]);
-        Files.write(staleRewriteTemp, new byte[0]);
-        Files.write(recentRawTemp, new byte[0]);
-        Files.write(interruptedSource, new byte[0]);
-        FileTime expiredTime = FileTime.from(expired);
-        Files.setLastModifiedTime(activeVariant, expiredTime);
-        Files.setLastModifiedTime(staleVariant, expiredTime);
-        Files.setLastModifiedTime(staleNoChange, expiredTime);
-        Files.setLastModifiedTime(unrelated, expiredTime);
-        Files.setLastModifiedTime(staleRawTemp, expiredTime);
-        Files.setLastModifiedTime(staleDeflateTemp, expiredTime);
-        Files.setLastModifiedTime(staleRewriteTemp, expiredTime);
-        Files.setLastModifiedTime(interruptedSource, expiredTime);
+        PackVariantManager.CacheUsage overTarget = manager.cacheUsage(10);
+        PackVariantManager.CacheUsage withinTarget = manager.cacheUsage(15);
 
-        PackVariantManager.CachePruneResult result = manager.pruneExpiredArtifacts(List.of(source));
-
-        assertEquals(6, result.removedArtifacts());
-        assertTrue(Files.isRegularFile(activeVariant));
-        assertFalse(Files.exists(staleVariant));
-        assertTrue(Files.isRegularFile(recentVariant));
-        assertFalse(Files.exists(staleNoChange));
-        assertTrue(Files.isRegularFile(unrelated));
-        assertFalse(Files.exists(staleRawTemp));
-        assertFalse(Files.exists(staleDeflateTemp));
-        assertFalse(Files.exists(staleRewriteTemp));
-        assertTrue(Files.isRegularFile(recentRawTemp));
-        assertFalse(Files.exists(interruptedSource));
-        assertTrue(Files.isRegularFile(recentSource));
+        assertEquals(15, overTarget.bytes());
+        assertTrue(overTarget.overWarningThreshold());
+        assertFalse(withinTarget.overWarningThreshold());
+        assertTrue(Files.isRegularFile(oldVariant));
+        assertTrue(Files.isRegularFile(interruptedWrite));
+        assertTrue(Files.isRegularFile(operatorFile));
     }
 
     @Test
-    void capsGeneratedCacheBytesWithoutDeletingCurrentVariants() throws Exception {
-        Path sourcePath = temporaryDirectory.resolve("quota-source.mcpack");
+    void leavesInvalidCacheArtifactsUntouched() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("invalid-cache-source.mcpack");
         writePack(sourcePath);
         UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         ResourcePack source = filePack(sourcePath, packId);
-        Path cacheDirectory = temporaryDirectory.resolve("quota-cache");
-        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
-        Path activeVariant = manager.prepare(source, PackProfile.SAFE).file();
-        String artifactPrefix = activeVariant.getFileName().toString().substring(0, 37);
-        Path oldest = cacheDirectory.resolve(artifactPrefix + "a".repeat(12) + "b".repeat(12) + "-safe.mcpack");
-        Path middle = cacheDirectory.resolve(artifactPrefix + "c".repeat(12) + "d".repeat(12) + "-safe.mcpack");
-        Path newest = cacheDirectory.resolve(artifactPrefix + "e".repeat(12) + "f".repeat(12) + "-safe.mcpack");
-        Files.copy(activeVariant, oldest);
-        Files.copy(activeVariant, middle);
-        Files.copy(activeVariant, newest);
-        Instant now = Instant.now();
-        Files.setLastModifiedTime(oldest, FileTime.from(now.minus(Duration.ofDays(3))));
-        Files.setLastModifiedTime(middle, FileTime.from(now.minus(Duration.ofDays(2))));
-        Files.setLastModifiedTime(newest, FileTime.from(now.minus(Duration.ofDays(1))));
+        Path cacheDirectory = temporaryDirectory.resolve("invalid-cache");
+        PackVariantManager first = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        Path cachedVariant = first.prepare(source, PackProfile.SAFE).file();
+        byte[] existingBytes = "preserve this cache file".getBytes(StandardCharsets.UTF_8);
+        Files.write(cachedVariant, existingBytes);
 
-        long activeSize = Files.size(activeVariant);
-        PackVariantManager.CachePruneResult result = manager.pruneExpiredArtifacts(List.of(source), activeSize * 2);
+        PackVariantManager restarted = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        PackVariantManager.PreparedVariant selected = restarted.prepare(source, PackProfile.SAFE);
 
-        assertEquals(2, result.removedArtifacts());
-        assertFalse(result.activeExceedsLimit());
-        assertTrue(Files.isRegularFile(activeVariant));
-        assertFalse(Files.exists(oldest));
-        assertFalse(Files.exists(middle));
-        assertTrue(Files.isRegularFile(newest));
-
-        PackVariantManager.CachePruneResult activeOverLimit =
-                manager.pruneExpiredArtifacts(List.of(source), activeSize / 2);
-        assertEquals(1, activeOverLimit.removedArtifacts());
-        assertTrue(activeOverLimit.activeExceedsLimit());
-        assertTrue(Files.isRegularFile(activeVariant));
-        assertFalse(Files.exists(newest));
+        assertSame(source, selected.pack());
+        assertNull(selected.file());
+        assertArrayEquals(existingBytes, Files.readAllBytes(cachedVariant));
     }
 
     @Test
@@ -397,8 +517,7 @@ class PackVariantManagerTest {
             noChangeMarker = files.filter(file -> file.getFileName().toString().endsWith(".no-change"))
                     .findFirst().orElseThrow();
         }
-        Files.setLastModifiedTime(noChangeMarker, FileTime.from(Instant.now().minus(Duration.ofDays(31))));
-        assertEquals(0, manager.pruneExpiredArtifacts(List.of(source)).removedArtifacts());
+        manager.cacheUsage();
         assertTrue(Files.isRegularFile(noChangeMarker));
 
         PackVariantManager restarted = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
@@ -446,11 +565,25 @@ class PackVariantManagerTest {
         }
     }
 
+    private static byte[] manifest(UUID packId) {
+        return ("{\"format_version\":2,\"header\":{\"name\":\"Fettle Test\",\"uuid\":\""
+                + packId + "\",\"version\":[1,0,0]}}").getBytes(StandardCharsets.UTF_8);
+    }
+
     private ResourcePack filePack(Path path, UUID packId) {
-        return filePack(path, packId, new AtomicBoolean(true));
+        return filePack(path, packId, new AtomicBoolean(true), List.of());
     }
 
     private ResourcePack filePack(Path path, UUID packId, AtomicBoolean serializationAllowed) {
+        return filePack(path, packId, serializationAllowed, List.of());
+    }
+
+    private ResourcePack filePack(Path path, UUID packId, List<UUID> dependencyIds) {
+        return filePack(path, packId, new AtomicBoolean(true), dependencyIds);
+    }
+
+    private ResourcePack filePack(
+            Path path, UUID packId, AtomicBoolean serializationAllowed, List<UUID> dependencyIds) {
         PackCodec codec = new PackCodec() {
             @Override
             public byte[] sha256() {
@@ -491,12 +624,46 @@ class PackVariantManagerTest {
                 new Class<?>[]{ResourcePack.class},
                 (proxy, method, args) -> switch (method.getName()) {
                     case "codec" -> codec;
-                    case "uuid" -> packId;
+                    case "uuid" -> path.getFileName().toString().startsWith(packId + "-")
+                            ? headerUuid(path, packId) : packId;
+                    case "manifest" -> testManifest(dependencyIds);
                     case "toString" -> "test-pack:" + packId;
                     case "hashCode" -> System.identityHashCode(proxy);
                     case "equals" -> proxy == args[0];
                     default -> null;
                 });
+    }
+
+    private static ResourcePackManifest testManifest(List<UUID> dependencyIds) {
+        return (ResourcePackManifest) Proxy.newProxyInstance(
+                ResourcePackManifest.class.getClassLoader(),
+                new Class<?>[]{ResourcePackManifest.class},
+                (proxy, method, args) -> method.getName().equals("dependencies")
+                        ? dependencyIds.stream().map(PackVariantManagerTest::testDependency).toList()
+                        : null);
+    }
+
+    private static ResourcePackManifest.Dependency testDependency(UUID packId) {
+        return (ResourcePackManifest.Dependency) Proxy.newProxyInstance(
+                ResourcePackManifest.Dependency.class.getClassLoader(),
+                new Class<?>[]{ResourcePackManifest.Dependency.class},
+                (proxy, method, args) -> method.getName().equals("uuid") ? packId : null);
+    }
+
+    private static UUID headerUuid(Path path, UUID fallback) {
+        try (ZipFile zip = new ZipFile(path.toFile())) {
+            var entry = zip.getEntry("manifest.json");
+            if (entry == null) return fallback;
+            String json = new String(zip.getInputStream(entry).readAllBytes(), StandardCharsets.UTF_8);
+            int header = json.indexOf("\"header\"");
+            int uuid = json.indexOf("\"uuid\"", header);
+            int colon = json.indexOf(':', uuid);
+            int start = json.indexOf('"', colon);
+            int end = json.indexOf('"', start + 1);
+            return UUID.fromString(json.substring(start + 1, end));
+        } catch (Exception invalidOrMissingManifest) {
+            return fallback;
+        }
     }
 
     private static PackAuditReport audit(
