@@ -2384,7 +2384,7 @@ class PackOptimizerTest {
 
             assertTrue(report.warnings.any { it.contains("1 textures exceed Creator Tools' 4 MiB") })
             assertTrue(report.warnings.any { it.contains("textures/over_mip_budget.png") })
-            assertFalse(report.warnings.any { it.contains("a texture exceeds 2048px") })
+            assertFalse(report.warnings.any { it.contains("A texture is larger than 2,048 px") })
         }
     }
 
@@ -2476,7 +2476,7 @@ class PackOptimizerTest {
             assertFalse(audit.textureMetricsComplete)
             assertFalse(audit.atlasReferenceScanComplete)
             assertFalse(audit.textureHandleScanComplete)
-            assertTrue(audit.warnings.any { it.contains("__brarchive data is opaque") })
+            assertTrue(audit.warnings.any { it.contains("__brarchive data, which Fettle cannot read") })
             assertContentEquals(Files.readAllBytes(input), Files.readAllBytes(output))
             assertEquals(0, rewrite.pngEntriesOptimized)
             assertEquals(0, rewrite.entriesFiltered)
@@ -2513,7 +2513,7 @@ class PackOptimizerTest {
             val saferRange = auditFileCount(PackAuditReport.MOJANG_SAFER_PACK_FILE_COUNT + 1)
             val highCount = auditFileCount(PackAuditReport.MOJANG_HIGH_PACK_FILE_COUNT + 1)
 
-            assertTrue(saferRange.warnings.any { it.contains("5,000–7,000 safer file-count range") })
+            assertTrue(saferRange.warnings.any { it.contains("Mojang's safer range is 5,000–7,000") })
             assertTrue(saferRange.warnings.none { it.contains("run out of memory") })
             assertTrue(highCount.warnings.any { it.contains("run out of memory on some devices") })
         }
@@ -2612,7 +2612,7 @@ class PackOptimizerTest {
             assertEquals("textures/nexo/item/axe_stitched.png", report.largestPotentialAtlasTexturePath)
             assertEquals(512L * 128L * 4L, report.largestPotentialAtlasTextureMemoryBytes)
             assertEquals(1, report.potentialAtlasTexturesOverBudgetCount)
-            assertTrue(report.warnings.any { it.contains("256px maximum-dimension guidance") })
+            assertTrue(report.warnings.any { it.contains("256 px maximum-dimension guidance") })
         }
     }
 
@@ -2655,7 +2655,7 @@ class PackOptimizerTest {
 
             assertEquals(1, report.modelFileCount)
             assertEquals(1, report.oversizedModelCount)
-            assertTrue(report.warnings.any { it.contains("model files exceeded the bounded complexity scan") })
+            assertTrue(report.warnings.any { it.contains("Could not scan 1 model files within the complexity limit") })
         }
     }
 
@@ -2677,7 +2677,7 @@ class PackOptimizerTest {
             assertEquals("models/entity/mob.geo.json", report.largestModelPath)
             assertEquals(1, report.warnings.count { it.contains("50 cubes") })
             assertTrue(report.warnings.any {
-                it.contains("1 block model file exceeds 50 cubes (block maximum 55)")
+                it.contains("1 block model file exceeds 50 cubes (maximum: 55)")
             })
         }
     }

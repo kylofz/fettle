@@ -72,15 +72,15 @@ class DeviceProfileRuntimeTest {
         assertEquals(Map.of("OPTIMIZE_MINI", 5), live.profileSets());
         assertEquals(5, live.selectionOutcomes().values().stream().mapToInt(Integer::intValue).sum());
         assertEquals(1, live.selectionOutcomes().get(
-                "iOS (2), Protocol=786, GameVersion=1.26.52, GraphicsMode=2, MemoryTier=2, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=fit, stackAtlasPolicy=fit"));
+                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.52, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits"));
         assertEquals(1, live.selectionOutcomes().get(
-                "iOS (2), Protocol=786, GameVersion=1.26.51, GraphicsMode=0, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit"));
+                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.51, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits"));
         assertEquals(5, live.pendingInitialization().values().stream().mapToInt(Integer::intValue).sum());
         assertEquals(Map.of(2, 1), live.memoryTiers());
-        assertEquals(Map.of("iOS (2) [MemoryTier=2, GameVersion=1.26.52, Protocol=786]", 1), live.memoryTiersByPlatform());
-        assertEquals(Map.of("Android (1) [INVALID, GameVersion=1.26.52, Protocol=786]", 1,
-                "BedrockPlatform=IOS [UNDECODABLE, GameVersion=unknown, Protocol=786]", 1,
-                "iOS (2) [MISSING, GameVersion=1.26.51, Protocol=786]", 1), live.missingMemoryTierByPlatform());
+        assertEquals(Map.of("iOS (DeviceOS 2) [MemoryTier 2, game version 1.26.52, protocol 786]", 1), live.memoryTiersByPlatform());
+        assertEquals(Map.of("Android (DeviceOS 1) [tier claim INVALID, game version 1.26.52, protocol 786]", 1,
+                "Bedrock platform IOS [tier claim UNDECODABLE, game version unknown, protocol 786]", 1,
+                "iOS (DeviceOS 2) [tier claim MISSING, game version 1.26.51, protocol 786]", 1), live.missingMemoryTierByPlatform());
 
         assertNotNull(runtime.recordPostInitializationJoin(iosWithTier));
         assertNotNull(runtime.recordPostInitializationJoin(iosWithoutTier));
@@ -103,19 +103,19 @@ class DeviceProfileRuntimeTest {
         assertTrue(summary.pendingInitialization().isEmpty());
         assertEquals(5, summary.packJoinAttemptCounts().values().stream().mapToLong(Long::longValue).sum());
         assertEquals(Map.of(
-                "iOS (2), Protocol=786, GraphicsMode=2, MemoryTier=2, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=fit, stackAtlasPolicy=fit", 1L,
-                "iOS (2), Protocol=786, GraphicsMode=0, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit", 1L),
+                "platform iOS (DeviceOS 2), protocol 786, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits", 1L,
+                "platform iOS (DeviceOS 2), protocol 786, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
                 summary.postInitializationJoinCounts());
         assertEquals(summary.postInitializationJoinCounts().keySet(),
                 summary.postInitializationAverageMillis().keySet());
         assertTrue(summary.postInitializationAverageMillis().values().stream().allMatch(value -> value >= 0));
         assertEquals(3, summary.preInitializationDisconnectCounts().values().stream().mapToLong(Long::longValue).sum());
         assertEquals(Map.of(
-                "Android (1), Protocol=786, GraphicsMode=1, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit", 1L,
-                "BedrockPlatform=IOS, Protocol=786, GraphicsMode=unknown, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit", 1L,
-                "unknown platform, Protocol=786, GraphicsMode=unknown, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit", 1L),
+                "platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L,
+                "platform Bedrock platform IOS, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L,
+                "platform unknown, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
                 summary.preInitializationDisconnectCounts());
-        assertEquals(Map.of("Android (1), Protocol=786, GraphicsMode=1, MemoryTier=unknown, profiles=OPTIMIZE_MINI, packFiles=1, memoryBudget=unknown, stackAtlasPolicy=fit", 1L),
+        assertEquals(Map.of("platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
                 summary.resourcePackReasonDisconnectCounts());
         runtime.clearSessions();
         assertTrue(runtime.summary().pendingInitialization().isEmpty());

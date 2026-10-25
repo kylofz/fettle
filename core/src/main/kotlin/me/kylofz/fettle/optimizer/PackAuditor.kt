@@ -229,26 +229,26 @@ public class PackAuditor {
 
         val warnings = TreeSet<String>()
         when {
-            rootPackIconCount == 0 -> warnings += "root pack_icon.png is missing (Creator Tools CPACKICON101)"
-            rootPackIconCount > 1 -> warnings += "multiple root pack_icon.png entries found (Creator Tools CPACKICON102)"
-            rootPackIconDimensions == null -> warnings += "root pack_icon.png could not be validated as a PNG"
+            rootPackIconCount == 0 -> warnings += "Root pack_icon.png is missing (Creator Tools CPACKICON101)."
+            rootPackIconCount > 1 -> warnings += "Pack contains multiple root pack_icon.png entries (Creator Tools CPACKICON102)."
+            rootPackIconDimensions == null -> warnings += "Root pack_icon.png could not be validated as a PNG."
             rootPackIconDimensions.width != rootPackIconDimensions.height -> warnings +=
-                "root pack_icon.png is ${rootPackIconDimensions.width}x${rootPackIconDimensions.height}; Creator Tools recommends a square icon, typically 256x256 (CPACKICON104)"
+                "Root pack_icon.png is ${rootPackIconDimensions.width}x${rootPackIconDimensions.height}. Creator Tools recommends a square icon, typically 256x256 (CPACKICON104)."
         }
         if (opaqueBedrockArchivePresent) {
-            warnings += "Bedrock __brarchive data is opaque to Fettle; decoded textures, atlas references, texture handles, and packed-entry counts are incomplete"
+            warnings += "This pack contains Bedrock __brarchive data, which Fettle cannot read. Texture, atlas, handle, and file-count estimates are incomplete."
         }
-        if (uncompressedBytes > 100L * MIB) warnings += "uncompressed pack exceeds 100 MiB"
+        if (uncompressedBytes > 100L * MIB) warnings += "Uncompressed pack size exceeds 100 MiB."
         if (fileCount > PackAuditReport.MOJANG_HIGH_PACK_FILE_COUNT) {
-            warnings += "pack exceeds 10,000 files; Mojang has seen packs at this size run out of memory on some devices"
+            warnings += "Pack has over 10,000 files. Mojang has seen packs this large run out of memory on some devices."
         } else if (fileCount > PackAuditReport.MOJANG_SAFER_PACK_FILE_COUNT) {
-            warnings += "pack exceeds Mojang's 5,000–7,000 safer file-count range; recommended to stay under 10,000"
+            warnings += "Pack has over 7,000 files. Mojang's safer range is 5,000–7,000; keep packs under 10,000."
         }
         if (estimatedTextureHandleCount > PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE) {
-            warnings += "$estimatedTextureHandleCount estimated distinct texture handles exceed Creator Tools' ${PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE}-handle add-on guidance"
+            warnings += "Estimated texture handles: $estimatedTextureHandleCount. This exceeds Creator Tools' ${PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE}-handle add-on guidance."
         }
         if (textureMemoryBytes > 256L * MIB) {
-            warnings += "decoded texture estimate exceeds Fettle's 256 MiB warning threshold; this is not an official crash limit"
+            warnings += "Estimated decoded texture memory exceeds Fettle's 256 MiB warning threshold. This is not an official crash limit."
         }
         if (texturesOverHighestResolutionMipBudget > 0) {
             val examples = textureHotspots.filter {
@@ -257,44 +257,44 @@ public class PackAuditor {
             warnings += "$texturesOverHighestResolutionMipBudget textures exceed Creator Tools' 4 MiB highest-resolution-mip warning budget" +
                 if (examples.isEmpty()) "" else " (examples: $examples)"
         }
-        if (maxTextureDimension > 2_048) warnings += "a texture exceeds 2048px"
+        if (maxTextureDimension > 2_048) warnings += "A texture is larger than 2,048 px."
         if (unmeasuredTextureCount > 0) {
             val examples = unmeasuredTextureExamples.joinToString(", ").takeIf { it.isNotEmpty() }
                 ?.let { " (examples: $it)" }.orEmpty()
-            warnings += "$unmeasuredTextureCount textures could not be measured$examples; AUTO cannot verify the decoded texture budget"
+            warnings += "$unmeasuredTextureCount textures could not be measured$examples. AUTO cannot verify the decoded texture budget."
         }
-        if (oversizedModelCount > 0) warnings += "$oversizedModelCount model files exceeded the bounded complexity scan"
-        if (pngAnimationMetadataCount > 0) warnings += "$pngAnimationMetadataCount PNG animation metadata files keep their textures at source resolution"
+        if (oversizedModelCount > 0) warnings += "Could not scan $oversizedModelCount model files within the complexity limit."
+        if (pngAnimationMetadataCount > 0) warnings += "$pngAnimationMetadataCount PNG animation metadata files keep their textures at source resolution."
         if (potentialAtlasTexturesOverBudgetCount > 0) {
-            warnings += "$potentialAtlasTexturesOverBudgetCount potential atlas texture(s) exceed Creator Tools' 256px maximum-dimension guidance"
+            warnings += "$potentialAtlasTexturesOverBudgetCount potential atlas textures exceed Creator Tools' 256 px maximum-dimension guidance."
         }
         val estimatedItemAtlasAllocation = PackAuditReport.roundedAtlasAllocationBytes(itemAtlasTextureMemoryBytes)
         val estimatedBlockAtlasAllocation = PackAuditReport.roundedAtlasAllocationBytes(blockAtlasTextureMemoryBytes)
         if (estimatedItemAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_WARNING_BYTES) {
-            warnings += "estimated Bedrock item-atlas allocation rounds up to $estimatedItemAtlasAllocation bytes"
+            warnings += "Estimated Bedrock item-atlas allocation rounds up to $estimatedItemAtlasAllocation bytes."
         }
         if (estimatedBlockAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_WARNING_BYTES) {
-            warnings += "estimated Bedrock block-atlas allocation rounds up to $estimatedBlockAtlasAllocation bytes"
+            warnings += "Estimated Bedrock block-atlas allocation rounds up to $estimatedBlockAtlasAllocation bytes."
         }
         if (estimatedItemAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES ||
             estimatedBlockAtlasAllocation > PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES
         ) {
-            warnings += "estimated Bedrock atlas allocation exceeds Creator Tools' 256 MiB hard limit; this is a validator limit, not a client crash guarantee"
+            warnings += "Estimated Bedrock atlas allocation exceeds Creator Tools' 256 MiB hard limit. This validator limit does not predict client crashes."
         }
         if (rootFontGlyphCount > 0) {
-            warnings += "$rootFontGlyphCount root font glyph page(s) are outside the documented texts/<language>/font path; " +
-                "$rootFontGlyphTextureMemoryBytes measured decoded bytes are counted conservatively"
+            warnings += "$rootFontGlyphCount root font glyph pages are outside texts/<language>/font. " +
+                "$rootFontGlyphTextureMemoryBytes measured decoded bytes are counted conservatively."
         }
         if (!atlasReferenceScanComplete) {
-            warnings += "Atlas references could not be fully scanned; atlas-size guidance is incomplete"
+            warnings += "Atlas references could not be fully scanned. Atlas estimates are incomplete."
         }
         if (!textureHandleScanComplete) {
-            warnings += "Texture-handle references could not be fully scanned; the handle estimate is incomplete"
+            warnings += "Texture-handle references could not be fully scanned. The handle estimate is incomplete."
         }
         if (blockModelFilesOver50Cubes > 0) {
             val modelFiles = if (blockModelFilesOver50Cubes == 1) "1 block model file exceeds" else
                 "$blockModelFilesOver50Cubes block model files exceed"
-            warnings += "$modelFiles 50 cubes (block maximum $maxBlockModelCubes); Microsoft's guidance targets frequently placed block models"
+            warnings += "$modelFiles 50 cubes (maximum: $maxBlockModelCubes). Microsoft's warning applies to custom block models placed often."
         }
 
         return PackAuditReport(

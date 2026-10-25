@@ -30,11 +30,11 @@ public data class BedrockDeviceCapabilities @JvmOverloads constructor(
 ) {
     public val memoryTierDescription: String
         get() = when (memoryTier) {
-            0 -> "SuperLow (roughly <1.5 GB RAM)"
-            1 -> "Low (roughly <2 GB RAM)"
-            2 -> "Mid (roughly <4 GB RAM)"
-            3 -> "High (roughly <8 GB RAM)"
-            4 -> "SuperHigh (roughly >8 GB RAM)"
+            0 -> "SuperLow"
+            1 -> "Low"
+            2 -> "Mid"
+            3 -> "High"
+            4 -> "SuperHigh"
             else -> "unknown"
         }
 

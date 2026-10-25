@@ -78,7 +78,7 @@ class BedrockDeviceCapabilitiesTest {
     }
 
     @Test
-    fun describesMemoryTierAsAReportedBandNotAnExactRamReading() {
+    fun describesMemoryTierWithoutImplyingARamMeasurement() {
         val descriptions = (0..4).map { tier ->
             BedrockDeviceCapabilities.fromGeyserClientDataJwt(jwt("""{"MemoryTier":$tier}"""), null)
                 .memoryTierDescription
@@ -86,11 +86,11 @@ class BedrockDeviceCapabilitiesTest {
 
         assertEquals(
             listOf(
-                "SuperLow (roughly <1.5 GB RAM)",
-                "Low (roughly <2 GB RAM)",
-                "Mid (roughly <4 GB RAM)",
-                "High (roughly <8 GB RAM)",
-                "SuperHigh (roughly >8 GB RAM)",
+                "SuperLow",
+                "Low",
+                "Mid",
+                "High",
+                "SuperHigh",
             ),
             descriptions,
         )

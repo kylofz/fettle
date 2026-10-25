@@ -138,13 +138,13 @@ final class DeviceProfileRuntime {
                 memoryTierFailures.merge(capabilities.getMemoryTierClaimStatus(), 1, Integer::sum);
                 if (platform == null) missingMemoryTierUnknownPlatform++;
                 else missingMemoryTierByPlatform.merge(
-                        platform + " [" + capabilities.getMemoryTierClaimStatus() + ", GameVersion="
-                                + gameVersion + ", Protocol=" + protocolVersion + "]", 1, Integer::sum);
+                        platform + " [tier claim " + capabilities.getMemoryTierClaimStatus() + ", game version "
+                                + gameVersion + ", protocol " + protocolVersion + "]", 1, Integer::sum);
             } else {
                 memoryTiers.merge(tier, 1, Integer::sum);
                 memoryTiersByPlatform.merge(
-                        (platform == null ? "unknown platform" : platform) + " [MemoryTier=" + tier
-                                + ", GameVersion=" + gameVersion + ", Protocol=" + protocolVersion + "]",
+                        (platform == null ? "unknown platform" : platform) + " [MemoryTier " + tier
+                                + ", game version " + gameVersion + ", protocol " + protocolVersion + "]",
                         1, Integer::sum);
             }
         }
@@ -169,7 +169,7 @@ final class DeviceProfileRuntime {
         String memoryTier = snapshot.selectionMemoryTier() == null
                 ? "unknown" : snapshot.selectionMemoryTier().toString();
         String gameVersion = includeGameVersion
-                ? ", GameVersion=" + (capabilities.getGameVersion() == null ? "unknown" : capabilities.getGameVersion())
+                ? ", game version " + (capabilities.getGameVersion() == null ? "unknown" : capabilities.getGameVersion())
                 : "";
         String protocolVersion = protocolVersionLabel(snapshot.geyserProtocolVersion());
         String graphicsMode = capabilities.getGraphicsMode() == null
@@ -181,14 +181,14 @@ final class DeviceProfileRuntime {
             else packFiles += pack.report().getFileCount();
         }
         String memoryBudgetFit = !snapshot.budgetKnown() || !snapshot.metricsComplete()
-                ? "unknown" : snapshot.withinBudget() ? "fit" : "over";
+                ? "unknown" : snapshot.withinBudget() ? "fits" : "exceeded";
         String atlasFit = !snapshot.atlasMetricsComplete()
-                ? "unknown" : snapshot.withinStackAtlasPolicy() ? "fit" : "over";
-        return (platform == null ? "unknown platform" : platform) + ", Protocol=" + protocolVersion + gameVersion
-                + ", GraphicsMode=" + graphicsMode + ", MemoryTier=" + memoryTier
-                + ", profiles=" + selectedProfileSet(snapshot)
-                + ", packFiles=" + (packFileCountComplete ? Long.toString(packFiles) : "partial~" + packFiles)
-                + ", memoryBudget=" + memoryBudgetFit + ", stackAtlasPolicy=" + atlasFit;
+                ? "unknown" : snapshot.withinStackAtlasPolicy() ? "fits" : "exceeded";
+        return "platform " + (platform == null ? "unknown" : platform) + ", protocol " + protocolVersion + gameVersion
+                + ", graphics mode " + graphicsMode + ", MemoryTier " + memoryTier
+                + ", selected profiles " + selectedProfileSet(snapshot)
+                + ", pack files " + (packFileCountComplete ? Long.toString(packFiles) : "partial (~" + packFiles + ")")
+                + ", budget " + memoryBudgetFit + ", atlas policy " + atlasFit;
     }
 
     private static String protocolVersionLabel(int protocolVersion) {
@@ -205,10 +205,10 @@ final class DeviceProfileRuntime {
         Integer deviceOs = capabilities.getDeviceOs();
         if (deviceOs != null) {
             String label = capabilities.getDeviceOsLabel();
-            return label == null ? "DeviceOS=" + deviceOs : label + " (" + deviceOs + ")";
+            return label == null ? "DeviceOS " + deviceOs : label + " (DeviceOS " + deviceOs + ")";
         }
         String platform = capabilities.getPlatform();
-        return platform == null || platform.equalsIgnoreCase("UNKNOWN") ? null : "BedrockPlatform=" + platform;
+        return platform == null || platform.equalsIgnoreCase("UNKNOWN") ? null : "Bedrock platform " + platform;
     }
 
     record Summary(
