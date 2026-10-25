@@ -28,7 +28,19 @@ final class DeviceProfileRuntime {
             PackProfile playerOverride,
             Map<Integer, Long> textureBudgetOverrides,
             PackSetAudit packSetAudit) {
-        BedrockDeviceCapabilities capabilities = capabilitiesReader.read(connection);
+        return plan(readCapabilities(connection), configuredProfile, playerOverride, textureBudgetOverrides, packSetAudit);
+    }
+
+    BedrockDeviceCapabilities readCapabilities(GeyserConnection connection) {
+        return capabilitiesReader.read(connection);
+    }
+
+    DeviceSelectionPlanner.Plan plan(
+            BedrockDeviceCapabilities capabilities,
+            PackProfile configuredProfile,
+            PackProfile playerOverride,
+            Map<Integer, Long> textureBudgetOverrides,
+            PackSetAudit packSetAudit) {
         return planner.plan(capabilities, configuredProfile, playerOverride, textureBudgetOverrides, packSetAudit);
     }
 

@@ -36,7 +36,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 final class PackVariantManager {
-    static final String REWRITE_REVISION = "device-tier-v40";
+    static final String REWRITE_REVISION = "device-tier-v41";
     static final List<PackProfile> PREWARM_PROFILES = List.of(
             PackProfile.FULL, PackProfile.OPTIMIZE_FULL, PackProfile.OPTIMIZE_SEMI,
             PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
@@ -128,8 +128,10 @@ final class PackVariantManager {
             Collection<ResourcePack> originals,
             Collection<ResourcePack> packStack,
             Collection<PackProfile> profiles) throws Exception {
-        List<ResourcePack> packs = List.copyOf(originals);
-        List<ResourcePack> stack = List.copyOf(packStack);
+        List<ResourcePack> packs = originals.stream()
+                .sorted(java.util.Comparator.comparing(pack -> pack.uuid().toString())).toList();
+        List<ResourcePack> stack = packStack.stream()
+                .sorted(java.util.Comparator.comparing(pack -> pack.uuid().toString())).toList();
         Map<UUID, String> stackHashes = new HashMap<>();
         for (ResourcePack pack : stack) {
             if (stackHashes.put(pack.uuid(), sourceHash(pack)) != null) {
@@ -602,8 +604,11 @@ final class PackVariantManager {
 
     private String packSetFingerprint(List<ResourcePack> packs, Map<UUID, String> sourceHashes) throws Exception {
         StringBuilder identity = new StringBuilder();
-        for (ResourcePack pack : packs) identity.append(pack.uuid()).append(':')
+        for (ResourcePack pack : packs.stream()
+                .sorted(java.util.Comparator.comparing(candidate -> candidate.uuid().toString())).toList()) {
+            identity.append(pack.uuid()).append(':')
                 .append(sourceHashes.getOrDefault(pack.uuid(), "")).append('\n');
+        }
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(identity.toString().getBytes(StandardCharsets.UTF_8)));
     }

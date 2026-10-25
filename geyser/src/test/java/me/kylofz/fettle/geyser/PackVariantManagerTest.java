@@ -268,6 +268,52 @@ class PackVariantManagerTest {
     }
 
     @Test
+    void keepsPreparedAuditsForTwoSessionSpecificPackStacks() throws Exception {
+        UUID baseId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        UUID fullId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
+        UUID simpleId = UUID.fromString("4d4de4ff-cf09-6f80-b4f6-3c99622b1d0f");
+        Path basePath = temporaryDirectory.resolve("session-base.mcpack");
+        Path fullPath = temporaryDirectory.resolve("session-full.mcpack");
+        Path simplePath = temporaryDirectory.resolve("session-simple.mcpack");
+        writePack(basePath);
+        writePack(fullPath);
+        writePack(simplePath);
+        ResourcePack base = filePack(basePath, baseId);
+        ResourcePack full = filePack(fullPath, fullId);
+        ResourcePack simple = filePack(simplePath, simpleId);
+        List<PackProfile> profiles = List.of(PackProfile.FULL, PackProfile.OPTIMIZE_FULL,
+                PackProfile.OPTIMIZE_SEMI, PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
+        java.util.function.Function<Path, ResourcePack> factory = path -> {
+            String filename = path.getFileName().toString();
+            for (UUID id : List.of(baseId, fullId, simpleId)) {
+                if (filename.startsWith(id + "-")) return filePack(path, id);
+            }
+            throw new IllegalArgumentException("Unrecognized cached pack " + filename);
+        };
+        PackVariantManager manager = new PackVariantManager(temporaryDirectory.resolve("session-pack-cache"), factory);
+
+        List<ResourcePack> fullStack = List.of(base, full);
+        manager.prepareSet(fullStack, profiles);
+        PackSetAudit fullAudit = PackSetAudit.collect(fullStack, fullStack, pack -> true, manager);
+        Path fullBaseVariant = fullAudit.preparedVariants().get(baseId).get(PackProfile.OPTIMIZE_MINI).file();
+
+        List<ResourcePack> simpleStack = List.of(base, simple);
+        manager.prepareSet(simpleStack, profiles);
+        PackSetAudit simpleAudit = PackSetAudit.collect(simpleStack, simpleStack, pack -> true, manager);
+        Path simpleBaseVariant = simpleAudit.preparedVariants().get(baseId).get(PackProfile.OPTIMIZE_MINI).file();
+
+        assertTrue(fullAudit.preparedPackStackMatches());
+        assertTrue(simpleAudit.preparedPackStackMatches());
+        assertFalse(fullBaseVariant.equals(simpleBaseVariant));
+        assertEquals(fullBaseVariant,
+                fullAudit.preparedVariant(base, PackProfile.OPTIMIZE_MINI, manager).file());
+        assertEquals(simpleBaseVariant,
+                simpleAudit.preparedVariant(base, PackProfile.OPTIMIZE_MINI, manager).file());
+        Files.delete(fullBaseVariant);
+        assertNull(fullAudit.preparedVariant(base, PackProfile.OPTIMIZE_MINI, manager));
+    }
+
+    @Test
     void protectsSharedTexturePathsAndCacheAgainstTheFullRequiredPackStack() throws Exception {
         UUID baseId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         UUID overlayId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
@@ -320,6 +366,13 @@ class PackVariantManagerTest {
             assertTrue(attachable.contains("textures/model/frame"));
         }
         assertTrue(manager.matchesPreparedSet(List.of(base, overlay, fixed), List.of(base, overlay)));
+        assertTrue(manager.matchesPreparedSet(List.of(fixed, overlay, base), List.of(overlay, base)));
+        java.util.function.Predicate<ResourcePack> targets = pack ->
+                pack.uuid().equals(baseId) || pack.uuid().equals(overlayId);
+        PackSetAudit preparedAudit = PackSetAudit.forSession(
+                null, List.of(base, overlay, fixed), targets, manager);
+        assertSame(preparedAudit, PackSetAudit.forSession(
+                preparedAudit, List.of(fixed, overlay, base), targets, manager));
 
         writeEntries(fixedPath, Map.of(
                 "manifest.json", "{}".getBytes(StandardCharsets.UTF_8),
@@ -425,7 +478,7 @@ class PackVariantManagerTest {
     }
 
     @Test
-    void packSetAuditSnapshotRequiresSamePackInstancesAndSourceContents() throws Exception {
+    void packSetAuditSnapshotMatchesPackIdsAndSourceContentsRegardlessOfOrder() throws Exception {
         UUID targetId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         UUID fixedId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
         Path targetPath = temporaryDirectory.resolve("target.mcpack");
@@ -439,7 +492,7 @@ class PackVariantManagerTest {
         PackSetAudit snapshot = PackSetAudit.forSession(null, List.of(target, fixed), matcher, null);
 
         assertSame(snapshot, PackSetAudit.forSession(snapshot, List.of(target, fixed), matcher, null));
-        assertFalse(snapshot == PackSetAudit.forSession(snapshot, List.of(fixed, target), matcher, null));
+        assertSame(snapshot, PackSetAudit.forSession(snapshot, List.of(fixed, target), matcher, null));
 
         Files.writeString(targetPath, "target-content-changed");
         PackSetAudit changedContent = PackSetAudit.forSession(snapshot, List.of(target, fixed), matcher, null);

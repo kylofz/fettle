@@ -6,7 +6,7 @@ import org.geysermc.geyser.api.pack.ResourcePack;
 import java.nio.file.Files;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,15 +70,18 @@ record PackSetAudit(
 
     boolean matches(Collection<ResourcePack> packs) {
         if (allPacks.size() != packs.size() || sourceHashes.size() != allPacks.size()) return false;
-        Iterator<ResourcePack> prepared = allPacks.iterator();
-        int index = 0;
-        // Geyser copies the session list but keeps the registered pack objects.
-        for (ResourcePack candidate : packs) {
-            if (prepared.next() != candidate) return false;
-            String currentHash = sourceHash(candidate);
-            if (currentHash.isEmpty() || !currentHash.equals(sourceHashes.get(index++))) return false;
+        Map<UUID, String> hashesById = new LinkedHashMap<>();
+        for (int index = 0; index < allPacks.size(); index++) {
+            if (hashesById.put(allPacks.get(index).uuid(), sourceHashes.get(index)) != null) return false;
         }
-        return true;
+        Set<UUID> seen = new HashSet<>();
+        // Geyser can enumerate the same required pack set in a different order at session load.
+        for (ResourcePack candidate : packs) {
+            if (!seen.add(candidate.uuid())) return false;
+            String currentHash = sourceHash(candidate);
+            if (currentHash.isEmpty() || !currentHash.equals(hashesById.get(candidate.uuid()))) return false;
+        }
+        return seen.size() == hashesById.size();
     }
 
     static PackSetAudit forSession(
@@ -127,6 +130,7 @@ record PackSetAudit(
         PackVariantManager.PreparedVariant variant = preparedVariants
                 .getOrDefault(original.uuid(), Map.of()).get(profile);
         if (variant != null && (variant.file() == null || Files.isRegularFile(variant.file()))) return variant;
+        if (profile != PackProfile.FULL && preparedPackStackMatches) return null;
         return variantManager == null ? null : variantManager.preparedVariantIfCached(original, profile);
     }
 
