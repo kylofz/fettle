@@ -21,6 +21,7 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -243,12 +245,14 @@ class PackVariantManagerTest {
         Path partialBaseLossless = losslessOnly.get(baseId).get(PackProfile.OPTIMIZE_FULL).file();
         Path partialOverlayLossless = losslessOnly.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file();
         byte[] retainedBaseBytes = Files.readAllBytes(partialBaseLossless);
-        Files.delete(partialOverlayLossless);
+        byte[] retainedOverlayBytes = Files.readAllBytes(partialOverlayLossless);
+        Files.write(partialOverlayLossless, "interrupted cache write".getBytes(StandardCharsets.UTF_8));
 
         PackVariantManager partialRecovery = new PackVariantManager(partialCacheDirectory, factory);
         Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> recoveredLossless =
                 partialRecovery.prepareSet(List.of(base, overlay), List.of(PackProfile.OPTIMIZE_FULL));
         assertArrayEquals(retainedBaseBytes, Files.readAllBytes(partialBaseLossless));
+        assertArrayEquals(retainedOverlayBytes, Files.readAllBytes(partialOverlayLossless));
         assertTrue(Files.isRegularFile(recoveredLossless.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file()));
 
         Files.delete(recoveredLossless.get(overlayId).get(PackProfile.OPTIMIZE_FULL).file());
@@ -528,11 +532,68 @@ class PackVariantManagerTest {
     }
 
     @Test
-    void leavesInvalidCacheArtifactsUntouched() throws Exception {
+    void prunesOldGeneratedVariantsButKeepsActiveAndUnrecognizedFiles() throws Exception {
+        Path cacheDirectory = temporaryDirectory.resolve("bounded-cache");
+        UUID oldId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        UUID activeId = UUID.fromString("3b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        Path oldSourcePath = temporaryDirectory.resolve("old-source.mcpack");
+        Path activeSourcePath = temporaryDirectory.resolve("active-source.mcpack");
+        writePack(oldSourcePath);
+        writePack(activeSourcePath);
+        ResourcePack oldSource = filePack(oldSourcePath, oldId);
+        ResourcePack activeSource = filePack(activeSourcePath, activeId);
+
+        PackVariantManager oldWriter = new PackVariantManager(cacheDirectory, path -> filePack(path, oldId));
+        Path oldVariant = oldWriter.prepare(oldSource, PackProfile.SAFE).file();
+        oldWriter.clear();
+        PackVariantManager activeWriter = new PackVariantManager(cacheDirectory, path -> filePack(path, activeId));
+        Path activeVariant = activeWriter.prepare(activeSource, PackProfile.SAFE).file();
+        Path operatorFile = cacheDirectory.resolve("operator-note.txt");
+        Files.writeString(operatorFile, "keep");
+
+        FileTime older = FileTime.fromMillis(1_000_000L);
+        FileTime newer = FileTime.fromMillis(2_000_000L);
+        Files.setLastModifiedTime(oldVariant, older);
+        Files.setLastModifiedTime(oldVariant.resolveSibling(oldVariant.getFileName() + ".integrity"), older);
+        Files.setLastModifiedTime(activeVariant, newer);
+        Files.setLastModifiedTime(activeVariant.resolveSibling(activeVariant.getFileName() + ".integrity"), newer);
+        PackVariantManager.CacheCleanup cleanup = activeWriter.pruneGeneratedArtifacts(0);
+
+        assertFalse(Files.exists(oldVariant));
+        assertFalse(Files.exists(oldVariant.resolveSibling(oldVariant.getFileName() + ".integrity")));
+        assertTrue(Files.isRegularFile(activeVariant));
+        assertTrue(Files.isRegularFile(activeVariant.resolveSibling(activeVariant.getFileName() + ".integrity")));
+        assertTrue(Files.isRegularFile(operatorFile));
+        assertEquals(2, cleanup.deletedFiles());
+    }
+
+    @Test
+    void removesOnlyOldFettleTemporaryFilesDuringCacheCleanup() throws Exception {
+        Path cacheDirectory = temporaryDirectory.resolve("temporary-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory);
+        Path staleTemporary = cacheDirectory.resolve(".fettle-raw-interrupted.tmp");
+        Path recentTemporary = cacheDirectory.resolve(".fettle-raw-recent.tmp");
+        Path operatorFile = cacheDirectory.resolve("operator-note.txt");
+        Files.writeString(staleTemporary, "stale");
+        Files.writeString(recentTemporary, "recent");
+        Files.writeString(operatorFile, "keep");
+        Files.setLastModifiedTime(staleTemporary, FileTime.fromMillis(1_000_000L));
+
+        PackVariantManager.CacheCleanup cleanup = manager.pruneGeneratedArtifacts(0);
+
+        assertFalse(Files.exists(staleTemporary));
+        assertTrue(Files.isRegularFile(recentTemporary));
+        assertTrue(Files.isRegularFile(operatorFile));
+        assertEquals(1, cleanup.deletedFiles());
+    }
+
+    @Test
+    void rebuildsInvalidCacheArtifactsWithoutChangingTheSource() throws Exception {
         Path sourcePath = temporaryDirectory.resolve("invalid-cache-source.mcpack");
         writePack(sourcePath);
         UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         ResourcePack source = filePack(sourcePath, packId);
+        byte[] sourceBytes = Files.readAllBytes(sourcePath);
         Path cacheDirectory = temporaryDirectory.resolve("invalid-cache");
         PackVariantManager first = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
         Path cachedVariant = first.prepare(source, PackProfile.SAFE).file();
@@ -542,9 +603,78 @@ class PackVariantManagerTest {
         PackVariantManager restarted = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
         PackVariantManager.PreparedVariant selected = restarted.prepare(source, PackProfile.SAFE);
 
-        assertSame(source, selected.pack());
-        assertNull(selected.file());
-        assertArrayEquals(existingBytes, Files.readAllBytes(cachedVariant));
+        assertNotSame(source, selected.pack());
+        assertEquals(cachedVariant, selected.file());
+        assertFalse(java.util.Arrays.equals(existingBytes, Files.readAllBytes(cachedVariant)));
+        assertArrayEquals(sourceBytes, Files.readAllBytes(sourcePath));
+        try (ZipFile zip = new ZipFile(cachedVariant.toFile())) {
+            assertNotNull(zip.getEntry("textures/test.png"));
+        }
+    }
+
+    @Test
+    void rejectsAValidButModifiedCachedArchiveAndRebuildsIt() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("modified-cache-source.mcpack");
+        writePack(sourcePath);
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        Path cacheDirectory = temporaryDirectory.resolve("modified-cache");
+        PackVariantManager first = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        Path cachedVariant = first.prepare(source, PackProfile.SAFE).file();
+        writeEntries(cachedVariant, Map.of(
+                "manifest.json", manifest(packId),
+                "tampered.txt", "valid zip, wrong cache contents".getBytes(StandardCharsets.UTF_8)));
+
+        PackVariantManager restarted = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        PackVariantManager.PreparedVariant recovered = restarted.prepare(source, PackProfile.SAFE);
+
+        assertNotNull(recovered.file());
+        try (ZipFile zip = new ZipFile(recovered.file().toFile())) {
+            assertNull(zip.getEntry("tampered.txt"));
+            assertNotNull(zip.getEntry("textures/test.png"));
+        }
+    }
+
+    @Test
+    void rejectsTamperedInMemoryCachedArchiveAndRebuildsIt() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("in-memory-cache-source.mcpack");
+        writePack(sourcePath);
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        Path cacheDirectory = temporaryDirectory.resolve("in-memory-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        Path cachedVariant = manager.prepare(source, PackProfile.SAFE).file();
+        writeEntries(cachedVariant, Map.of(
+                "manifest.json", manifest(packId),
+                "tampered.txt", "valid zip, wrong cache contents".getBytes(StandardCharsets.UTF_8)));
+
+        PackVariantManager.PreparedVariant recovered = manager.prepare(source, PackProfile.SAFE);
+
+        assertNotNull(recovered.file());
+        try (ZipFile zip = new ZipFile(recovered.file().toFile())) {
+            assertNull(zip.getEntry("tampered.txt"));
+            assertNotNull(zip.getEntry("textures/test.png"));
+        }
+    }
+
+    @Test
+    void prewarmedSessionAuditRejectsTamperedVariantBeforeReturningIt() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("prewarmed-cache-source.mcpack");
+        writePack(sourcePath);
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        PackVariantManager manager = new PackVariantManager(
+                temporaryDirectory.resolve("prewarmed-session-cache"), path -> filePack(path, packId));
+        manager.prepareSet(List.of(source), List.of(PackProfile.SAFE));
+        PackSetAudit audit = PackSetAudit.collect(List.of(source), List.of(source), pack -> true, manager);
+        PackVariantManager.PreparedVariant prepared = audit.preparedVariants().get(packId).get(PackProfile.SAFE);
+        assertNotNull(prepared);
+
+        writeEntries(prepared.file(), Map.of(
+                "manifest.json", manifest(packId),
+                "tampered.txt", "valid zip, wrong session contents".getBytes(StandardCharsets.UTF_8)));
+
+        assertNull(audit.preparedVariant(source, PackProfile.SAFE, manager));
     }
 
     @Test

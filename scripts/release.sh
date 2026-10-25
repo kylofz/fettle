@@ -11,15 +11,7 @@ fi
 
 ./gradlew --no-daemon clean test :geyser:jar
 
+scripts/verify-artifact.sh
 artifact="geyser/build/libs/fettle-${version}.jar"
-if [[ ! -f "$artifact" ]]; then
-  echo "Expected release artifact not found: $artifact" >&2
-  exit 1
-fi
-
-manifest="$(unzip -p "$artifact" extension.yml)"
-grep -Fxq "version: $version" <<< "$manifest"
-grep -Fxq "main: me.kylofz.fettle.geyser.FettleExtension" <<< "$manifest"
-jar --list --file "$artifact" | grep -Fx "me/kylofz/fettle/geyser/FettleExtension.class" >/dev/null
 
 gh release create "$tag" "$artifact" --verify-tag --generate-notes --title "Fettle $version"

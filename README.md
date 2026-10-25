@@ -10,7 +10,7 @@ Build and test with Java 21:
 ./gradlew clean test :geyser:jar
 ```
 
-Copy `geyser/build/libs/fettle-1.0.3.jar` to Geyser's `extensions` directory. The build targets Geyser API 2.12.0.
+Copy `geyser/build/libs/fettle-1.0.4.jar` to Geyser's `extensions` directory. The build targets Geyser API 2.12.0.
 
 ## Automatic selection
 
@@ -94,7 +94,7 @@ In `/fettle device`, `clientDataDecoded=false` means Fettle could not decode Gey
 
 ## Pack handling
 
-Fettle reads source packs without changing them. It stores generated variants in `extensions/fettle/pack-cache` and prepares them when Geyser loads its pack registry. A cold start with large packs can take several minutes. After Scaffolding regenerates a pack, restart Geyser so Fettle reads the new file. Fettle warns when the cache exceeds 2 GiB, but never deletes cache files automatically.
+Fettle reads source packs without changing them. It stores generated variants in `extensions/fettle/pack-cache` and prepares them when Geyser loads its pack registry. A cold start with large packs can take several minutes. After Scaffolding regenerates a pack, restart Geyser so Fettle reads the new file. Fettle stores a fingerprint and SHA-256 digest beside each generated pack. If either is missing or does not match, Fettle rebuilds that variant from the source pack. When generated variants exceed 2 GiB, Fettle removes the oldest variants that are not held by the current pack manager. It also removes recognized build temporary files older than 24 hours. Active variants and unrecognized files stay in place, so the cache can remain above 2 GiB when active or unrecognized files exceed that limit.
 
 When both `Scaffolding Animated` and `Scaffolding Animated Simple` are registered, Fettle prepares separate pack sets. It sends Simple to clients reporting MemoryTier 0–3 or no tier, and Full to clients reporting tier 4 or higher. In the checked split release, Simple has fewer model cubes but more source texture files. This choice uses client-reported data and cannot guarantee that a client will avoid a crash. If the selected pack set was not prepared or its IDs/content changed, Fettle keeps the original required packs. Install one Scaffolding base release. Split and non-split distributions can reuse a manifest UUID, and duplicate UUIDs prevent Fettle from preparing linked variants. Fettle warns if no profile brings a pack below Mojang's 7,000-file safer guidance.
 

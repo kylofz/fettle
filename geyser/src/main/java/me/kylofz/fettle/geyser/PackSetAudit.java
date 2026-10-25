@@ -129,7 +129,11 @@ record PackSetAudit(
         if (profile != PackProfile.FULL && !preparedPackStackMatches) return null;
         PackVariantManager.PreparedVariant variant = preparedVariants
                 .getOrDefault(original.uuid(), Map.of()).get(profile);
-        if (variant != null && (variant.file() == null || Files.isRegularFile(variant.file()))) return variant;
+        if (variant != null && variant.file() == null) return variant;
+        if (variant != null && variantManager != null) {
+            return variantManager.isPreparedVariantValid(variant) ? variant : null;
+        }
+        if (variant != null && Files.isRegularFile(variant.file())) return variant;
         if (profile != PackProfile.FULL && preparedPackStackMatches) return null;
         return variantManager == null ? null : variantManager.preparedVariantIfCached(original, profile);
     }

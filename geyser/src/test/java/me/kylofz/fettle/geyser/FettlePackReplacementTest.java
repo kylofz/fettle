@@ -9,11 +9,10 @@ import org.geysermc.geyser.api.pack.option.ResourcePackOption.Type;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -41,6 +40,37 @@ class FettlePackReplacementTest {
     }
 
     @Test
+    void replacementPreservesTheOriginalPackOrder() throws Exception {
+        ResourcePack first = pack(UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack original = pack(PACK_ID);
+        ResourcePack last = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack replacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, original, last));
+
+        assertTrue(replace(new FettleExtension(), event, original, replacement));
+
+        assertEquals(List.of(first, replacement, last), event.resourcePacks());
+    }
+
+    @Test
+    void failedLaterReplacementRestoresTheWholeLinkedGroup() throws Exception {
+        ResourcePack first = pack(PACK_ID);
+        UUID secondId = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        ResourcePack second = pack(secondId);
+        ResourcePack firstReplacement = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack secondReplacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, second));
+        event.failPack = secondReplacement;
+
+        assertFalse(new FettleExtension().replacePacks(
+                event,
+                List.of(first, second),
+                Map.of(first.uuid(), firstReplacement, second.uuid(), secondReplacement)));
+
+        assertEquals(List.of(first, second), event.resourcePacks());
+    }
+
+    @Test
     void failedReplacementRestoresTheRequiredOriginalPackWithItsOptions() throws Exception {
         ResourcePack original = pack(PACK_ID);
         ResourcePack replacement = pack(PACK_ID);
@@ -55,11 +85,8 @@ class FettlePackReplacementTest {
         assertEquals(List.of(subpack), event.options.get(PACK_ID));
     }
 
-    private static boolean replace(FettleExtension extension, FakeEvent event, ResourcePack original, ResourcePack replacement) throws Exception {
-        Method method = FettleExtension.class.getDeclaredMethod(
-                "replacePack", SessionLoadResourcePacksEvent.class, ResourcePack.class, ResourcePack.class);
-        method.setAccessible(true);
-        return (boolean) method.invoke(extension, event, original, replacement);
+    private static boolean replace(FettleExtension extension, FakeEvent event, ResourcePack original, ResourcePack replacement) {
+        return extension.replacePacks(event, event.resourcePacks(), Map.of(original.uuid(), replacement));
     }
 
     private static ResourcePack pack(UUID id) {
@@ -125,13 +152,18 @@ class FettlePackReplacementTest {
     }
 
     private static final class FakeEvent extends SessionLoadResourcePacksEvent {
-        private final Map<UUID, ResourcePack> packs = new HashMap<>();
-        private final Map<UUID, List<ResourcePackOption<?>>> options = new HashMap<>();
+        private final Map<UUID, ResourcePack> packs = new LinkedHashMap<>();
+        private final Map<UUID, List<ResourcePackOption<?>>> options = new LinkedHashMap<>();
         private ResourcePack failPack;
 
         private FakeEvent(GeyserConnection connection, ResourcePack original, List<ResourcePackOption<?>> initialOptions) {
             super(connection);
             register(original, initialOptions.toArray(ResourcePackOption<?>[]::new));
+        }
+
+        private FakeEvent(GeyserConnection connection, List<ResourcePack> initialPacks) {
+            super(connection);
+            initialPacks.forEach(pack -> register(pack, new ResourcePackOption<?>[0]));
         }
 
         @Override

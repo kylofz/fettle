@@ -11,15 +11,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HexFormat;
@@ -30,6 +33,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import java.util.function.Function;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -41,11 +45,18 @@ final class PackVariantManager {
             PackProfile.FULL, PackProfile.OPTIMIZE_FULL, PackProfile.OPTIMIZE_SEMI,
             PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
     private static final long MAX_CACHE_BYTES = 2L * 1024L * 1024L * 1024L;
+    private static final Pattern GENERATED_VARIANT = Pattern.compile(
+            "^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[0-9a-f]{24}-(?:optimize_full|optimize_semi|optimize_mini|safe)\\.mcpack$");
+    private static final Pattern GENERATED_SOURCE_TEMP = Pattern.compile(
+            "^\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[A-Za-z0-9_-]+\\.source\\.mcpack$");
+    private static final Pattern ZIP_TEMP = Pattern.compile("^\\.fettle-(?:raw|deflate)-[A-Za-z0-9_-]+\\.tmp$");
+    private static final long STALE_TEMP_AGE_MILLIS = 24L * 60L * 60L * 1000L;
     private final Path cacheDirectory;
     private final PackOptimizer optimizer = new PackOptimizer();
     private final PackAuditor auditor = new PackAuditor();
     private final Function<Path, ResourcePack> packFactory;
     private final Map<String, PreparedVariant> cache = new ConcurrentHashMap<>();
+    private final Map<Path, VerifiedArtifact> verifiedArtifacts = new HashMap<>();
     private String activeSetFingerprint = "";
     private String activePackStackFingerprint = "";
     private List<Set<Integer>> activeLinkedPackGroupIndexes = List.of();
@@ -87,33 +98,37 @@ final class PackVariantManager {
         Path output = outputFile(original, fingerprint, profile);
         boolean lossless = isLossless(profile);
         Path source = materialize(original);
+        Path temporary = null;
         try {
-            if (Files.exists(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-                return new PreparedVariant(fingerprint, profile, original, null, auditor.audit(source));
-            }
             if (auditor.hasOpaqueBedrockArchive(source)) {
                 return new PreparedVariant(fingerprint, profile, original, null, auditor.audit(source));
             }
+            temporary = Files.createTempFile(cacheDirectory, "." + output.getFileName(), ".tmp");
             PackOptimizationReport rewrite = switch (profile) {
                 case AUTO, FULL -> throw new IllegalStateException("AUTO/FULL have no generated pack");
-                case OPTIMIZE_FULL -> optimizer.optimizeForLowEnd(source, output);
-                case OPTIMIZE_SEMI -> optimizer.optimizeMini(source, output, List.of(), 512);
-                case OPTIMIZE_MINI -> optimizer.optimizeMini(source, output, List.of(), 256);
-                case SAFE -> optimizer.optimizeSafe(source, output, 128);
+                case OPTIMIZE_FULL -> optimizer.optimizeForLowEnd(source, temporary);
+                case OPTIMIZE_SEMI -> optimizer.optimizeMini(source, temporary, List.of(), 512);
+                case OPTIMIZE_MINI -> optimizer.optimizeMini(source, temporary, List.of(), 256);
+                case SAFE -> optimizer.optimizeSafe(source, temporary, 128);
             };
-            PackAuditReport audit = auditor.audit(output);
+            PackAuditReport audit = auditor.audit(temporary);
             if (lossless && rewrite.getOutputBytes() >= rewrite.getInputBytes()) {
                 PackAuditReport sourceAudit = auditor.audit(source);
                 if (!losslessRewriteUseful(rewrite, sourceAudit, audit)) {
-                    Files.deleteIfExists(output);
-                    markNoChange(noChangeMarker(output));
+                    Files.deleteIfExists(temporary);
+                    temporary = null;
+                    markNoChange(noChangeMarker(output), fingerprint);
                     return remember(cacheKey, new PreparedVariant(fingerprint, profile, original, null, sourceAudit));
                 }
             }
 
+            moveIntoPlace(temporary, output);
+            temporary = null;
             ResourcePack pack = packFactory.apply(output);
+            writeIntegrity(output, fingerprint);
             return remember(cacheKey, new PreparedVariant(fingerprint, profile, pack, output, audit));
         } finally {
+            if (temporary != null) Files.deleteIfExists(temporary);
             Files.deleteIfExists(source);
         }
     }
@@ -222,14 +237,6 @@ final class PackVariantManager {
         }
         if (allCached) return Map.copyOf(cached);
 
-        boolean occupiedCacheArtifact = originals.stream().anyMatch(original -> {
-            if (cached.containsKey(original.uuid())) return false;
-            Path output = outputFile(original, fingerprint(original, profile), profile);
-            return Files.exists(output, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-                    || isLossless(profile) && Files.exists(noChangeMarker(output), java.nio.file.LinkOption.NOFOLLOW_LINKS);
-        });
-        if (occupiedCacheArtifact) return Map.of();
-
         Map<UUID, PreparedVariant> losslessSources = new LinkedHashMap<>();
         boolean allLosslessSourcesCached = profile != PackProfile.OPTIMIZE_FULL;
         if (allLosslessSourcesCached) {
@@ -314,8 +321,7 @@ final class PackVariantManager {
 
                 if (lossless && (!useful || !losslessRewriteChanged(rewrites.get(index)))) {
                     Files.deleteIfExists(temporary);
-                    Files.deleteIfExists(output);
-                    markNoChange(noChangeMarker(output));
+                    markNoChange(noChangeMarker(output), fingerprint);
                     prepared.put(original.uuid(), remember(
                             cacheKey(original, fingerprint),
                             new PreparedVariant(fingerprint, profile, original, null, sourceAudit)));
@@ -324,6 +330,7 @@ final class PackVariantManager {
 
                 moveIntoPlace(temporary, output);
                 ResourcePack pack = packFactory.apply(output);
+                writeIntegrity(output, fingerprint);
                 prepared.put(original.uuid(), remember(
                         cacheKey(original, fingerprint),
                         new PreparedVariant(fingerprint, profile, pack, output, outputAudits.get(index))));
@@ -344,6 +351,10 @@ final class PackVariantManager {
         }
         String fingerprint = fingerprint(original, profile);
         return loadCached(original, profile, fingerprint, cacheKey(original, fingerprint));
+    }
+
+    synchronized boolean isPreparedVariantValid(PreparedVariant variant) {
+        return variant.file() == null || isVerifiedArtifact(variant.file(), variant.fingerprint());
     }
 
     synchronized boolean matchesPreparedSet(Collection<ResourcePack> originals) {
@@ -422,6 +433,131 @@ final class PackVariantManager {
         return new CacheUsage(bytes, bytes > warningThresholdBytes);
     }
 
+    synchronized CacheCleanup pruneGeneratedArtifacts() throws IOException {
+        return pruneGeneratedArtifacts(MAX_CACHE_BYTES);
+    }
+
+    synchronized CacheCleanup pruneGeneratedArtifacts(long retainedByteLimit) throws IOException {
+        if (retainedByteLimit < 0) throw new IllegalArgumentException("Pack cache retention limit cannot be negative");
+        Set<Path> activeFiles = cache.values().stream()
+                .map(PreparedVariant::file)
+                .filter(java.util.Objects::nonNull)
+                .map(PackVariantManager::normalizedPath)
+                .collect(java.util.stream.Collectors.toSet());
+        Map<String, List<Path>> pathsByVariant = new HashMap<>();
+        List<CachedFile> staleTemporaryFiles = new ArrayList<>();
+        long staleBefore = System.currentTimeMillis() - STALE_TEMP_AGE_MILLIS;
+        try (Stream<Path> files = Files.list(cacheDirectory)) {
+            var iterator = files.iterator();
+            while (iterator.hasNext()) {
+                Path file = iterator.next();
+                if (!Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue;
+                String name = file.getFileName().toString();
+                String variantName = generatedVariantName(name);
+                if (variantName != null) {
+                    pathsByVariant.computeIfAbsent(variantName, ignored -> new ArrayList<>()).add(file);
+                } else if (isOwnedTemporaryArtifact(name)) {
+                    try {
+                        if (Files.getLastModifiedTime(file, java.nio.file.LinkOption.NOFOLLOW_LINKS).toMillis() < staleBefore) {
+                            staleTemporaryFiles.add(new CachedFile(file, Files.size(file)));
+                        }
+                    } catch (IOException unavailableMetadata) {
+                        // Keep temporary files whose age or size cannot be checked safely.
+                    }
+                }
+            }
+        }
+
+        List<GeneratedCacheGroup> groups = new ArrayList<>(pathsByVariant.size());
+        long retainedBytes = 0;
+        for (Map.Entry<String, List<Path>> entry : pathsByVariant.entrySet()) {
+            List<CachedFile> files = new ArrayList<>(entry.getValue().size());
+            long groupBytes = 0;
+            long newestModification = Long.MIN_VALUE;
+            boolean active = activeFiles.contains(normalizedPath(cacheDirectory.resolve(entry.getKey())));
+            for (Path file : entry.getValue()) {
+                try {
+                    long size = Files.size(file);
+                    FileTime modified = Files.getLastModifiedTime(file, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    files.add(new CachedFile(file, size));
+                    groupBytes = saturatedAdd(groupBytes, size);
+                    newestModification = Math.max(newestModification, modified.toMillis());
+                } catch (IOException unavailableMetadata) {
+                    active = true;
+                    files.add(new CachedFile(file, 0));
+                    newestModification = Long.MAX_VALUE;
+                }
+            }
+            retainedBytes = saturatedAdd(retainedBytes, groupBytes);
+            groups.add(new GeneratedCacheGroup(entry.getKey(), files, groupBytes, newestModification, active));
+        }
+        groups.sort(Comparator.comparingLong(GeneratedCacheGroup::newestModification)
+                .thenComparing(GeneratedCacheGroup::variantName));
+
+        long deletedBytes = 0;
+        int deletedFiles = 0;
+        int failedDeletes = 0;
+        for (CachedFile file : staleTemporaryFiles) {
+            try {
+                if (Files.deleteIfExists(file.path())) {
+                    deletedBytes = saturatedAdd(deletedBytes, file.bytes());
+                    deletedFiles++;
+                }
+            } catch (IOException failedDelete) {
+                failedDeletes++;
+            }
+        }
+        for (GeneratedCacheGroup group : groups) {
+            if (retainedBytes <= retainedByteLimit) break;
+            if (group.active()) continue;
+            List<CachedFile> files = group.files().stream()
+                    .sorted(Comparator.comparing(file -> file.path().getFileName().toString().equals(group.variantName())))
+                    .toList();
+            long groupDeletedBytes = 0;
+            for (CachedFile file : files) {
+                try {
+                    if (Files.deleteIfExists(file.path())) {
+                        deletedBytes = saturatedAdd(deletedBytes, file.bytes());
+                        groupDeletedBytes = saturatedAdd(groupDeletedBytes, file.bytes());
+                        deletedFiles++;
+                    }
+                } catch (IOException failedDelete) {
+                    failedDeletes++;
+                }
+            }
+            retainedBytes = Math.max(0, retainedBytes - groupDeletedBytes);
+        }
+        return new CacheCleanup(deletedFiles, deletedBytes, retainedBytes, failedDeletes);
+    }
+
+    private static String generatedVariantName(String name) {
+        String candidate = name;
+        if (candidate.endsWith(".integrity")) candidate = candidate.substring(0, candidate.length() - ".integrity".length());
+        else if (candidate.endsWith(".no-change")) candidate = candidate.substring(0, candidate.length() - ".no-change".length());
+        return GENERATED_VARIANT.matcher(candidate).matches() ? candidate : null;
+    }
+
+    private static boolean isOwnedTemporaryArtifact(String name) {
+        if (ZIP_TEMP.matcher(name).matches() || GENERATED_SOURCE_TEMP.matcher(name).matches()) return true;
+        String candidate = name;
+        while (candidate.startsWith(".")) candidate = candidate.substring(1);
+        int marker = candidate.indexOf(".mcpack");
+        if (marker < 0) return false;
+        String base = candidate.substring(0, marker + ".mcpack".length());
+        String suffix = candidate.substring(marker + ".mcpack".length());
+        return GENERATED_VARIANT.matcher(base).matches()
+                && (suffix.matches("[A-Za-z0-9._-]+\\.tmp")
+                || suffix.matches("\\.no-change[A-Za-z0-9_-]+\\.tmp"));
+    }
+
+    private static Path normalizedPath(Path path) {
+        return path.toAbsolutePath().normalize();
+    }
+
+    private static long saturatedAdd(long first, long second) {
+        return Long.MAX_VALUE - first < second ? Long.MAX_VALUE : first + second;
+    }
+
     List<PreparedVariant> cachedVariants() {
         return new ArrayList<>(cache.values());
     }
@@ -434,8 +570,9 @@ final class PackVariantManager {
         return linkedProfileGroups;
     }
 
-    void clear() {
+    synchronized void clear() {
         cache.clear();
+        verifiedArtifacts.clear();
         activeSetFingerprint = "";
         activePackStackFingerprint = "";
         activeLinkedPackGroupIndexes = List.of();
@@ -458,14 +595,14 @@ final class PackVariantManager {
             throws IOException {
         PreparedVariant prepared = cache.get(cacheKey);
         if (prepared != null && prepared.fingerprint().equals(fingerprint) &&
-                (prepared.file() == null || Files.isRegularFile(prepared.file()))) {
+                (prepared.file() == null || isVerifiedArtifact(prepared.file(), fingerprint))) {
             if (profile != PackProfile.FULL && prepared.audit().getOpaqueBedrockArchivePresent()) return null;
             return prepared;
         }
         if (profile == PackProfile.FULL) return null;
 
         Path output = outputFile(original, fingerprint, profile);
-        if (Files.isRegularFile(output)) {
+        if (isVerifiedArtifact(output, fingerprint)) {
             try {
                 PackAuditReport audit = auditor.audit(output);
                 if (audit.getOpaqueBedrockArchivePresent()) return null;
@@ -475,7 +612,7 @@ final class PackVariantManager {
                 return null;
             }
         }
-        if (isLossless(profile) && Files.isRegularFile(noChangeMarker(output))) {
+        if (isLossless(profile) && isValidNoChangeMarker(noChangeMarker(output), fingerprint)) {
             PackAuditReport audit = sourceAudit(original);
             if (!audit.getOpaqueBedrockArchivePresent()) {
                 return remember(cacheKey, new PreparedVariant(fingerprint, profile, original, null, audit));
@@ -509,12 +646,106 @@ final class PackVariantManager {
         }
     }
 
-    private static void markNoChange(Path marker) {
+    private void markNoChange(Path marker, String fingerprint) {
+        Path temporary = null;
         try {
-            Files.createFile(marker);
-        } catch (FileAlreadyExistsException ignored) {
+            temporary = Files.createTempFile(cacheDirectory, "." + marker.getFileName(), ".tmp");
+            Files.writeString(temporary, fingerprint + "\n", StandardCharsets.UTF_8);
+            moveIntoPlace(temporary, marker);
+            temporary = null;
         } catch (IOException ignored) {
             // shortcut: marker-write failure repeats lossless CPU work on restart but does not affect pack safety.
+        } finally {
+            if (temporary != null) {
+                try {
+                    Files.deleteIfExists(temporary);
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private void writeIntegrity(Path output, String fingerprint) throws IOException {
+        Path temporary = Files.createTempFile(cacheDirectory, "." + output.getFileName(), ".integrity.tmp");
+        try {
+            Files.writeString(temporary, fingerprint + "\n" + sha256(output) + "\n", StandardCharsets.UTF_8);
+            moveIntoPlace(temporary, integrityFile(output));
+            rememberVerifiedArtifact(output, fingerprint);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    private boolean isVerifiedArtifact(Path output, String fingerprint) {
+        Path integrity = integrityFile(output);
+        Path key = normalizedPath(output);
+        try {
+            FileStamp outputStamp = fileStamp(output);
+            FileStamp integrityStamp = fileStamp(integrity);
+            if (outputStamp == null || integrityStamp == null || integrityStamp.size() > 2048) {
+                verifiedArtifacts.remove(key);
+                return false;
+            }
+            VerifiedArtifact remembered = verifiedArtifacts.get(key);
+            if (remembered != null && remembered.fingerprint().equals(fingerprint)
+                    && remembered.output().equals(outputStamp) && remembered.integrity().equals(integrityStamp)) {
+                return true;
+            }
+            boolean valid = Files.readString(integrity, StandardCharsets.UTF_8)
+                    .equals(fingerprint + "\n" + sha256(output) + "\n");
+            if (valid) verifiedArtifacts.put(key, new VerifiedArtifact(fingerprint, outputStamp, integrityStamp));
+            else verifiedArtifacts.remove(key);
+            return valid;
+        } catch (IOException invalidArtifact) {
+            verifiedArtifacts.remove(key);
+            return false;
+        }
+    }
+
+    private void rememberVerifiedArtifact(Path output, String fingerprint) {
+        try {
+            FileStamp outputStamp = fileStamp(output);
+            FileStamp integrityStamp = fileStamp(integrityFile(output));
+            if (outputStamp != null && integrityStamp != null) {
+                verifiedArtifacts.put(normalizedPath(output),
+                        new VerifiedArtifact(fingerprint, outputStamp, integrityStamp));
+            }
+        } catch (IOException ignored) {
+            // A missing metadata snapshot only makes the next cache read verify the digest again.
+        }
+    }
+
+    private static FileStamp fileStamp(Path path) throws IOException {
+        BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isRegularFile()) return null;
+        return new FileStamp(attributes.size(), attributes.lastModifiedTime(), attributes.fileKey());
+    }
+
+    private static boolean isValidNoChangeMarker(Path marker, String fingerprint) {
+        try {
+            return Files.isRegularFile(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && Files.size(marker) <= 2048
+                    && Files.readString(marker, StandardCharsets.UTF_8).equals(fingerprint + "\n");
+        } catch (IOException invalidMarker) {
+            return false;
+        }
+    }
+
+    private static Path integrityFile(Path output) {
+        return output.resolveSibling(output.getFileName() + ".integrity");
+    }
+
+    private static String sha256(Path path) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = Files.newInputStream(path)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) >= 0) digest.update(buffer, 0, read);
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new AssertionError(impossible);
         }
     }
 
@@ -597,8 +828,8 @@ final class PackVariantManager {
         try {
             Files.move(temp, output, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
                     java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(temp, output, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            throw new IOException("Atomic cache publication is not supported for " + output.getFileName(), unsupported);
         }
     }
 
@@ -704,5 +935,25 @@ final class PackVariantManager {
     }
 
     record CacheUsage(long bytes, boolean overWarningThreshold) {
+    }
+
+    record CacheCleanup(int deletedFiles, long deletedBytes, long retainedGeneratedBytes, int failedDeletes) {
+    }
+
+    private record CachedFile(Path path, long bytes) {
+    }
+
+    private record FileStamp(long size, FileTime modified, Object fileKey) {
+    }
+
+    private record VerifiedArtifact(String fingerprint, FileStamp output, FileStamp integrity) {
+    }
+
+    private record GeneratedCacheGroup(
+            String variantName,
+            List<CachedFile> files,
+            long bytes,
+            long newestModification,
+            boolean active) {
     }
 }

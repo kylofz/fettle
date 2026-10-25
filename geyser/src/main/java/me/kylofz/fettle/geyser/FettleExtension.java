@@ -127,13 +127,22 @@ public final class FettleExtension implements Extension {
       });
       this.preparedPackSetAudits = Map.copyOf(prepared);
       try {
+         PackVariantManager.CacheCleanup cleanup = this.variantManager.pruneGeneratedArtifacts();
+         if (cleanup.deletedFiles() > 0) {
+            this.logger().info("Removed " + cleanup.deletedFiles() + " inactive generated pack-cache files ("
+               + this.humanBytes(cleanup.deletedBytes()) + "); active variants and unrecognized files were kept.");
+         }
+         if (cleanup.failedDeletes() > 0) {
+            this.logger().warning("Could not remove " + cleanup.failedDeletes()
+               + " inactive generated pack-cache files.");
+         }
          PackVariantManager.CacheUsage usage = this.variantManager.cacheUsage();
          if (usage.overWarningThreshold()) {
             this.logger().warning("Fettle's pack cache uses " + this.humanBytes(usage.bytes())
-               + ", above the 2 GiB advisory limit. Cache files were kept.");
+               + ", above the 2 GiB advisory limit after safe cleanup of inactive generated variants.");
          }
       } catch (Exception | LinkageError failure) {
-         this.logger().warning("Could not measure pack-cache size: "
+         this.logger().warning("Could not prune or measure pack-cache size: "
             + failure.getClass().getSimpleName());
       }
    }
@@ -231,28 +240,50 @@ public final class FettleExtension implements Extension {
       }
       DeviceProfilePolicy.Selection selection = plan.selection();
       Map<java.util.UUID, PackProfile> selectedProfiles = new java.util.LinkedHashMap<>();
+      Map<java.util.UUID, ResourcePack> replacements = new java.util.LinkedHashMap<>();
+      List<ResourcePack> originalStack = List.copyOf(event.resourcePacks());
+      boolean variantsReady = true;
 
       for (ResourcePack original : plan.packSetAudit().targetPacks()) {
          PackProfile selected = selection.profiles().getOrDefault(original.uuid(), PackProfile.FULL);
+         ResourcePack replacement = original;
          try {
-            ResourcePack replacement = selected == PackProfile.FULL
-               ? original
-               : this.preparedVariant(plan.packSetAudit(), original, selected);
+            if (selected != PackProfile.FULL) replacement = this.preparedVariant(plan.packSetAudit(), original, selected);
             if (replacement == null) {
                this.logger().warning("Could not load the selected " + selected.name() + " variant for pack "
-                  + original.uuid() + ". Keeping the original pack.");
+                  + original.uuid() + ". Keeping the complete original target pack set.");
+               variantsReady = false;
                selected = PackProfile.FULL;
-            } else if (replacement != original && !this.replacePack(event, original, replacement)) {
-               this.logger().warning("Could not safely replace pack " + original.uuid()
-                  + ". Keeping the original pack.");
-               selected = PackProfile.FULL;
+               replacement = original;
             }
          } catch (RuntimeException | LinkageError failure) {
             this.logger().warning("Selection failed for pack " + original.uuid() + " ("
-               + failure.getClass().getSimpleName() + "). Keeping the original pack.");
+               + failure.getClass().getSimpleName() + "). Keeping the complete original target pack set.");
+            variantsReady = false;
             selected = PackProfile.FULL;
+            replacement = original;
          }
+         replacements.put(original.uuid(), replacement);
          selectedProfiles.put(original.uuid(), selected);
+      }
+
+      if (!variantsReady) {
+         for (ResourcePack original : plan.packSetAudit().targetPacks()) {
+            replacements.put(original.uuid(), original);
+            selectedProfiles.put(original.uuid(), PackProfile.FULL);
+         }
+      } else {
+         try {
+            if (!this.replacePacks(event, originalStack, replacements)) {
+               this.logger().warning("Could not register the selected pack set for " + connection.bedrockUsername()
+                  + ". Restored the original required pack stack.");
+               selectedProfiles.replaceAll((uuid, ignored) -> PackProfile.FULL);
+            }
+         } catch (RuntimeException | LinkageError rollbackFailure) {
+            this.logger().severe("Fettle could not restore the original pack stack for "
+               + connection.bedrockUsername() + " after a registration failure.", rollbackFailure);
+            return;
+         }
       }
 
       String scaffoldingAnimation = ScaffoldingPackPolicy.selectedAnimation(event.resourcePacks());
@@ -758,38 +789,67 @@ public final class FettleExtension implements Extension {
       }
    }
 
-   private boolean replacePack(SessionLoadResourcePacksEvent event, ResourcePack original, ResourcePack replacement) {
-      Collection<ResourcePackOption<?>> options;
+   boolean replacePacks(
+      SessionLoadResourcePacksEvent event,
+      List<ResourcePack> originalStack,
+      Map<java.util.UUID, ResourcePack> replacements
+   ) {
+      if (!samePackOrder(event.resourcePacks(), originalStack)) return false;
+      Map<java.util.UUID, List<ResourcePackOption<?>>> options = new java.util.LinkedHashMap<>();
+      List<ResourcePack> desiredStack = new ArrayList<>(originalStack.size());
+      java.util.Set<java.util.UUID> desiredIds = new java.util.HashSet<>();
+      boolean changed = false;
       try {
-         options = new ArrayList<>(event.options(original.uuid()));
-      } catch (RuntimeException | LinkageError ignored) {
+         for (ResourcePack original : originalStack) {
+            List<ResourcePackOption<?>> packOptions = event.options(original.uuid()).stream()
+               .filter(Objects::nonNull).toList();
+            options.put(original.uuid(), packOptions);
+            ResourcePack desired = replacements.getOrDefault(original.uuid(), original);
+            if (!desiredIds.add(desired.uuid())) return false;
+            for (ResourcePackOption<?> option : packOptions) option.validate(desired);
+            desiredStack.add(desired);
+            changed |= desired != original;
+         }
+      } catch (RuntimeException | LinkageError invalidOptions) {
          return false;
       }
-
-      ResourcePackOption<?>[] reusable = options.stream().filter(Objects::nonNull).toArray(ResourcePackOption[]::new);
-      if (!event.unregister(original.uuid())) return false;
+      if (!changed) return true;
 
       try {
-         event.register(replacement, reusable);
+         for (ResourcePack original : originalStack) {
+            if (!event.unregister(original.uuid())) throw new IllegalStateException("Could not remove pack " + original.uuid());
+         }
+         for (int index = 0; index < desiredStack.size(); index++) {
+            ResourcePack desired = desiredStack.get(index);
+            ResourcePack original = originalStack.get(index);
+            event.register(desired, options.get(original.uuid()).toArray(ResourcePackOption<?>[]::new));
+         }
+         if (!samePackOrder(event.resourcePacks(), desiredStack)) {
+            throw new IllegalStateException("Geyser changed the registered pack order");
+         }
          return true;
-      } catch (RuntimeException | LinkageError replacementFailure) {
+      } catch (RuntimeException | LinkageError registrationFailure) {
          try {
-            event.unregister(original.uuid());
-            event.register(original, reusable);
+            for (ResourcePack current : List.copyOf(event.resourcePacks())) event.unregister(current.uuid());
+            if (!event.resourcePacks().isEmpty()) throw new IllegalStateException("Could not clear the failed pack set");
+            for (int index = 0; index < originalStack.size(); index++) {
+               ResourcePack original = originalStack.get(index);
+               event.register(original, options.get(original.uuid()).toArray(ResourcePackOption<?>[]::new));
+            }
+            if (!samePackOrder(event.resourcePacks(), originalStack)) {
+               throw new IllegalStateException("Geyser changed the restored pack order");
+            }
             return false;
          } catch (RuntimeException | LinkageError restoreFailure) {
-            restoreFailure.addSuppressed(replacementFailure);
-            try {
-               event.register(original, new ResourcePackOption<?>[0]);
-               this.logger().warning("Restored pack " + original.uuid()
-                  + " without its original options after variant registration failed.");
-               return false;
-            } catch (RuntimeException | LinkageError finalRestoreFailure) {
-               finalRestoreFailure.addSuppressed(restoreFailure);
-               throw finalRestoreFailure;
-            }
+            restoreFailure.addSuppressed(registrationFailure);
+            throw new IllegalStateException("Could not restore the original Geyser resource-pack stack", restoreFailure);
          }
       }
+   }
+
+   private static boolean samePackOrder(Collection<ResourcePack> actual, List<ResourcePack> expected) {
+      return actual.stream().map(ResourcePack::uuid).toList()
+         .equals(expected.stream().map(ResourcePack::uuid).toList());
    }
 
    static String failureDescription(Throwable failure) {
