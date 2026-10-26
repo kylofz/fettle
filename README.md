@@ -10,7 +10,7 @@ Build and test with Java 21:
 ./gradlew clean test :geyser:jar
 ```
 
-Copy `geyser/build/libs/fettle-1.0.5.jar` to Geyser's `extensions` directory. The build targets Geyser API 2.12.0.
+Copy `geyser/build/libs/fettle-1.0.6.jar` to Geyser's `extensions` directory. The build targets Geyser API 2.12.0.
 
 ## Automatic selection
 
