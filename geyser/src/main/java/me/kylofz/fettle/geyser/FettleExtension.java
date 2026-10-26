@@ -266,10 +266,79 @@ public final class FettleExtension implements Extension {
       BedrockDeviceCapabilities capabilities,
       PackProfile override
    ) {
-      PackSetAudit audit = this.preparedPackSetAudits.get(variant);
-      if (audit == null || !audit.preparedPackStackMatches()
-         || !audit.matches(packStack, packOptions(packStack, event::options))) return null;
-      return this.deviceProfiles.plan(capabilities, this.profile, override, this.textureBudgetOverrides, audit);
+      try {
+         PackSetAudit audit = this.ensurePreparedPackSet(packStack, variant,
+            packOptions(packStack, event::options), true, override);
+         return this.deviceProfiles.plan(capabilities, this.profile, override, this.textureBudgetOverrides, audit);
+      } catch (Exception | LinkageError failure) {
+         this.recordPackPreparationFailure(variant, failureDescription(failure));
+         return null;
+      }
+   }
+
+   private PackSetAudit ensurePreparedPackSet(
+      List<ResourcePack> packs,
+      ScaffoldingPackPolicy.AnimationVariant variant,
+      Map<java.util.UUID, List<ResourcePackOption<?>>> options,
+      boolean automatic,
+      PackProfile override
+   ) {
+      PackSetAudit prepared = this.preparedPackSetAudits.get(variant);
+      if (prepared != null && prepared.matches(packs, options)
+         && (prepared.preparedPackStackMatches()
+            || packs.stream().noneMatch(this::matchesTargetPack))) return prepared;
+
+      List<ResourcePack> targets = packs.stream().filter(this::matchesTargetPack).toList();
+      if (targets.isEmpty()) {
+         return PackSetAudit.forSession(prepared, packs, this::matchesTargetPack, this.variantManager, options);
+      }
+      if (this.variantManager == null) throw new IllegalStateException("Fettle's pack manager is unavailable");
+
+      PackProfile requested = override != null && override != PackProfile.AUTO ? override : this.profile;
+      List<PackProfile> profiles = automatic || requested == PackProfile.AUTO
+         ? PackVariantManager.PREWARM_PROFILES
+         : requested == PackProfile.FULL
+            ? List.of(PackProfile.FULL) : List.of(PackProfile.FULL, requested);
+      try {
+         PackSetAudit current = this.variantManager.prepareAndAuditSet(
+            packs, this::matchesTargetPack, profiles, options);
+         if (!current.preparedPackStackMatches() || !current.matches(packs, options)) {
+            throw new IllegalStateException("Fettle could not prepare the current required pack stack");
+         }
+         this.publishPreparedPackSet(variant, current);
+         return current;
+      } catch (Exception | LinkageError failure) {
+         throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+            "Fettle could not prepare the current required pack stack.", failure);
+      }
+   }
+
+   private synchronized void publishPreparedPackSet(
+      ScaffoldingPackPolicy.AnimationVariant variant,
+      PackSetAudit audit
+   ) {
+      Map<ScaffoldingPackPolicy.AnimationVariant, PackSetAudit> prepared =
+         new EnumMap<>(ScaffoldingPackPolicy.AnimationVariant.class);
+      prepared.putAll(this.preparedPackSetAudits);
+      prepared.put(variant, audit);
+      this.preparedPackSetAudits = Map.copyOf(prepared);
+
+      Map<ScaffoldingPackPolicy.AnimationVariant, String> failures =
+         new EnumMap<>(ScaffoldingPackPolicy.AnimationVariant.class);
+      failures.putAll(this.packPreparationFailures);
+      failures.remove(variant);
+      this.packPreparationFailures = Map.copyOf(failures);
+   }
+
+   private synchronized void recordPackPreparationFailure(
+      ScaffoldingPackPolicy.AnimationVariant variant,
+      String failure
+   ) {
+      Map<ScaffoldingPackPolicy.AnimationVariant, String> failures =
+         new EnumMap<>(ScaffoldingPackPolicy.AnimationVariant.class);
+      failures.putAll(this.packPreparationFailures);
+      failures.put(variant, failure);
+      this.packPreparationFailures = Map.copyOf(failures);
    }
 
    @Subscribe(postOrder = PostOrder.LAST)
@@ -303,22 +372,15 @@ public final class FettleExtension implements Extension {
             ? this.selectMeasuredAnimationVariant(event, fullAnimation, simpleAnimation, capabilities, override)
             : ScaffoldingPackPolicy.selectForMemoryTier(event.resourcePacks(), capabilities.getMemoryTier())
          : ScaffoldingPackPolicy.currentSelection(event.resourcePacks());
-      PackSetAudit prewarmedPackSetAudit = this.preparedPackSetAudits.get(animationChoice.variant());
       if (animationChoice.omitted() != null) {
          List<ResourcePack> selectedStack = ScaffoldingPackPolicy.stackWithout(
             event.resourcePacks(), animationChoice.omitted());
-         if (prewarmedPackSetAudit == null || !prewarmedPackSetAudit.matches(
-            selectedStack, packOptions(selectedStack, event::options))) {
-            this.logger().warning("Kept both Scaffolding animation packs for " + connection.bedrockUsername()
-               + ". The selected " + animationChoice.variant().name()
-               + " pack set was not prepared or its IDs/content changed. Original packs will be sent.");
-            animationChoice = ScaffoldingPackPolicy.currentSelection(event.resourcePacks());
-            prewarmedPackSetAudit = this.preparedPackSetAudits.get(animationChoice.variant());
-         } else if (!event.unregister(animationChoice.omitted().uuid())) {
+         this.ensurePreparedPackSet(selectedStack, animationChoice.variant(),
+            packOptions(selectedStack, event::options), automatic, override);
+         if (!event.unregister(animationChoice.omitted().uuid())) {
             this.logger().warning("Could not remove one Scaffolding animation pack for "
                + connection.bedrockUsername() + ". Original packs will be sent.");
             animationChoice = ScaffoldingPackPolicy.currentSelection(event.resourcePacks());
-            prewarmedPackSetAudit = this.preparedPackSetAudits.get(animationChoice.variant());
          } else {
             this.logger().info("Selected " + animationChoice.variant().name() + " Scaffolding animation for "
                + connection.bedrockUsername() + " from reported MemoryTier "
@@ -327,14 +389,8 @@ public final class FettleExtension implements Extension {
       }
       List<ResourcePack> currentStack = List.copyOf(event.resourcePacks());
       Map<java.util.UUID, List<ResourcePackOption<?>>> currentOptions = packOptions(currentStack, event::options);
-      if (automatic && currentStack.stream().anyMatch(this::matchesTargetPack)
-         && (prewarmedPackSetAudit == null || !prewarmedPackSetAudit.matches(currentStack, currentOptions))) {
-         DeviceProfilePolicy.Status status = this.packPreparationFailures.containsKey(animationChoice.variant())
-            ? DeviceProfilePolicy.Status.FAILED : DeviceProfilePolicy.Status.UNMEASURED;
-         throw new SelectionRejectedException(status,
-            "Fettle AUTO cannot use an unprepared or changed required pack stack. "
-               + "Result: " + status + ". The stack must be prepared and audited before a player session starts.");
-      }
+      PackSetAudit prewarmedPackSetAudit = this.ensurePreparedPackSet(
+         currentStack, animationChoice.variant(), currentOptions, automatic, override);
       PackSetAudit packSetAudit = PackSetAudit.forSession(
          prewarmedPackSetAudit, event.resourcePacks(), this::matchesTargetPack, this.variantManager,
          currentOptions);
@@ -345,15 +401,6 @@ public final class FettleExtension implements Extension {
       DeviceSelectionPlanner.Plan plan = this.deviceProfiles.plan(
          capabilities, this.profile, override, this.textureBudgetOverrides, packSetAudit);
       automatic = plan.automatic();
-      if (automatic && this.variantManager != null && !packSetAudit.preparedPackStackMatches()) {
-         this.logger().warning("Skipped optimized profiles for " + connection.bedrockUsername()
-            + ": this session's required packs differ from the prepared set. Original packs will be sent."
-            + " Prepared UUIDs=" + (prewarmedPackSetAudit == null ? List.of()
-               : prewarmedPackSetAudit.allPacks().stream().map(ResourcePack::uuid).toList())
-            + " hashes=" + (prewarmedPackSetAudit == null ? List.of() : prewarmedPackSetAudit.sourceHashes())
-            + "; session UUIDs=" + packSetAudit.allPacks().stream().map(ResourcePack::uuid).toList()
-            + " hashes=" + packSetAudit.sourceHashes() + ".");
-      }
       DeviceProfilePolicy.Selection selection = plan.selection();
       if (automatic && !selection.satisfiesPolicy()) {
          throw new SelectionRejectedException(selection.status(),

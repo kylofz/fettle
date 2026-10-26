@@ -247,6 +247,22 @@ final class PackVariantManager {
         return Map.copyOf(result);
     }
 
+    synchronized PackSetAudit prepareAndAuditSet(
+            Collection<ResourcePack> packStack,
+            java.util.function.Predicate<ResourcePack> targetMatcher,
+            Collection<PackProfile> profiles,
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> packOptions) throws Exception {
+        List<ResourcePack> stack = List.copyOf(packStack);
+        List<ResourcePack> targets = stack.stream().filter(targetMatcher).toList();
+        Set<UUID> targetIds = targets.stream().map(ResourcePack::uuid)
+                .collect(java.util.stream.Collectors.toSet());
+        for (ResourcePack pack : stack) {
+            if (!targetIds.contains(pack.uuid())) prepare(pack, PackProfile.FULL);
+        }
+        if (!targets.isEmpty()) prepareSet(targets, stack, profiles, packOptions);
+        return PackSetAudit.collect(stack, targets, targetMatcher, this, packOptions);
+    }
+
     private Map<UUID, PreparedVariant> prepareOriginalSet(List<ResourcePack> originals) throws Exception {
         Map<UUID, PreparedVariant> prepared = new LinkedHashMap<>();
         for (ResourcePack original : originals) prepared.put(original.uuid(), prepare(original, PackProfile.FULL));

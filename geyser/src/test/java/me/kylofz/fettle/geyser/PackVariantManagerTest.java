@@ -593,6 +593,37 @@ class PackVariantManagerTest {
     }
 
     @Test
+    void preparesLateRegisteredPackAgainstTheCompleteSessionStackBeforeMiniSelection() throws Exception {
+        Path fixedPath = temporaryDirectory.resolve("fixed-before-nexo.mcpack");
+        Path targetPath = temporaryDirectory.resolve("late-generated-nexo.mcpack");
+        writePack(fixedPath);
+        writePack(targetPath);
+        UUID fixedId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
+        UUID targetId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack fixed = filePack(fixedPath, fixedId);
+        ResourcePack target = filePack(targetPath, targetId);
+        var matcher = (java.util.function.Predicate<ResourcePack>) pack -> pack.uuid().equals(targetId);
+        PackVariantManager manager = new PackVariantManager(
+                temporaryDirectory.resolve("late-generated-cache"), path -> filePack(path, targetId));
+
+        PackSetAudit startup = manager.prepareAndAuditSet(
+                List.of(fixed), matcher, List.of(PackProfile.FULL), Map.of());
+        PackSetAudit stale = PackSetAudit.forSession(
+                startup, List.of(fixed, target), matcher, manager);
+
+        assertFalse(stale.preparedPackStackMatches());
+        assertNull(stale.preparedVariant(target, PackProfile.OPTIMIZE_MINI, manager));
+
+        PackSetAudit current = manager.prepareAndAuditSet(
+                List.of(fixed, target), matcher, List.of(PackProfile.FULL, PackProfile.OPTIMIZE_MINI), Map.of());
+
+        assertTrue(current.preparedPackStackMatches());
+        PackVariantManager.PreparedVariant mini = current.preparedVariant(target, PackProfile.OPTIMIZE_MINI, manager);
+        assertNotNull(mini);
+        assertEquals(256L * 128L * 4L, mini.audit().getTextureMemoryBytes());
+    }
+
+    @Test
     void reportsPackCacheSizeWithoutDeletingFiles() throws Exception {
         Path cacheDirectory = temporaryDirectory.resolve("pack-cache");
         PackVariantManager manager = new PackVariantManager(cacheDirectory);
