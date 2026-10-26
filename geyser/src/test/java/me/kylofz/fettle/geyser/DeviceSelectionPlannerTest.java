@@ -43,6 +43,30 @@ class DeviceSelectionPlannerTest {
     }
 
     @Test
+    void fixedPackUnsupportedForOptimizationDoesNotRejectMeasuredAutomaticSelection() {
+        UUID fixedId = UUID.fromString("d64da2bc-9df9-4d1a-975c-32f472350d71");
+        PackSetAudit candidates = auditSet(1100 * MIB, 900 * MIB, 420 * MIB, 210 * MIB, 100 * MIB);
+        PackAuditReport fixed = new PackAuditReport(
+                0, 0, 2, 0, 1, 10 * MIB,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                0, 0, null,
+                true, true, true, 0, 0, List.of(),
+                List.of(), 0, 0, 0, 0, 0, false, true);
+        PackSetAudit withUnchangedFixedPack = new PackSetAudit(
+                List.of(), List.of(), List.of(), Map.of(), candidates.variantReports(), Map.of(fixedId, fixed),
+                List.of(), 10 * MIB, 1, 0, 0, true, 1, true, true);
+
+        DeviceProfilePolicy.Selection selection = new DeviceSelectionPlanner().plan(
+                capabilities("ANDROID", 2), PackProfile.AUTO, null, Map.of(), withUnchangedFixedPack).selection();
+
+        assertEquals(PackProfile.OPTIMIZE_MINI, selection.profiles().get(PACK_ID));
+        assertEquals(DeviceProfilePolicy.Status.DEGRADED, selection.status());
+        assertTrue(selection.satisfiesPolicy());
+        assertTrue(selection.withinBudget());
+    }
+
+    @Test
     void selectionUsesMemoryTierInsteadOfDeviceOs() {
         PackSetAudit candidates = auditSet(1100 * MIB, 900 * MIB, 420 * MIB, 210 * MIB, 100 * MIB);
         DeviceSelectionPlanner.Plan android = plan(capabilities("ANDROID", 3), candidates, Map.of());

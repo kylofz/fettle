@@ -68,10 +68,6 @@ final class DeviceSelectionPlanner {
                         packSetAudit.fixedAtlasMetricsComplete(), packSetAudit.fixedPackFileCount(),
                         DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, packSetAudit.fixedTextureHandleUpperBound(),
                         packSetAudit.fixedHandleMetricsComplete(), DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT);
-                if (automatic && packSetAudit.fixedPackReports().values().stream()
-                        .anyMatch(PackAuditReport::getOptimizationUnsupported)) {
-                    selection = selection.withStatus(DeviceProfilePolicy.Status.UNSUPPORTED);
-                }
                 selections.put(key, selection);
             }
         }

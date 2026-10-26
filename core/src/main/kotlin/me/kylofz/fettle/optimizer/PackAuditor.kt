@@ -160,9 +160,12 @@ public class PackAuditor {
                 }
 
                 if (!isTexture(lowerName)) continue
-                textureFileCount++
                 val dimensions = zip.getInputStream(entry).use { readTextureDimensions(lowerName, it) }
-                if (lowerName == "pack_icon.png") rootPackIconDimensions = dimensions
+                if (lowerName == "pack_icon.png") {
+                    rootPackIconDimensions = dimensions
+                    continue
+                }
+                textureFileCount++
                 if (dimensions == null) {
                     unmeasuredTextureCount++
                     if (unmeasuredTextureExamples.size < 3) {
