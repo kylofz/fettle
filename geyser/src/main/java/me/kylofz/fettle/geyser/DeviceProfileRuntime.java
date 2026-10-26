@@ -21,6 +21,7 @@ final class DeviceProfileRuntime {
     private final Map<String, LongAdder> postInitializationElapsedNanos = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> preInitializationDisconnects = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> resourcePackReasonDisconnects = new ConcurrentHashMap<>();
+    private final Map<DeviceProfilePolicy.Status, LongAdder> rejectedSelections = new ConcurrentHashMap<>();
 
     DeviceSelectionPlanner.Plan plan(
             GeyserConnection connection,
@@ -79,6 +80,10 @@ final class DeviceProfileRuntime {
         }
     }
 
+    void recordRejectedSelection(DeviceProfilePolicy.Status status) {
+        rejectedSelections.computeIfAbsent(status, ignored -> new LongAdder()).increment();
+    }
+
     void removeSession(GeyserConnection connection) {
         sessions.remove(connection);
         selectionStartedNanos.remove(connection);
@@ -92,6 +97,7 @@ final class DeviceProfileRuntime {
         postInitializationElapsedNanos.clear();
         preInitializationDisconnects.clear();
         resourcePackReasonDisconnects.clear();
+        rejectedSelections.clear();
     }
 
     Summary summary() {
@@ -106,6 +112,7 @@ final class DeviceProfileRuntime {
         Map<String, Long> postInitializationAverageMillis = new TreeMap<>();
         Map<String, Long> preInitializationDisconnectCounts = new TreeMap<>();
         Map<String, Long> resourcePackReasonDisconnectCounts = new TreeMap<>();
+        Map<DeviceProfilePolicy.Status, Long> rejectedSelectionCounts = new EnumMap<>(DeviceProfilePolicy.Status.class);
         Map<MemoryTierClaimStatus, Integer> memoryTierFailures = new EnumMap<>(MemoryTierClaimStatus.class);
         packJoinAttempts.forEach((key, count) -> packJoinAttemptCounts.put(key, count.sum()));
         postInitializationJoins.forEach((key, count) -> postInitializationJoinCounts.put(key, count.sum()));
@@ -116,6 +123,7 @@ final class DeviceProfileRuntime {
         });
         preInitializationDisconnects.forEach((key, count) -> preInitializationDisconnectCounts.put(key, count.sum()));
         resourcePackReasonDisconnects.forEach((key, count) -> resourcePackReasonDisconnectCounts.put(key, count.sum()));
+        rejectedSelections.forEach((status, count) -> rejectedSelectionCounts.put(status, count.sum()));
         int undecodedClientData = 0;
         int missingMemoryTier = 0;
         int missingMemoryTierUnknownPlatform = 0;
@@ -152,7 +160,7 @@ final class DeviceProfileRuntime {
                 missingMemoryTierUnknownPlatform, profileSets, selectionOutcomes, memoryTiers, memoryTiersByPlatform,
                 pendingInitialization, packJoinAttemptCounts, postInitializationJoinCounts, postInitializationAverageMillis,
                 preInitializationDisconnectCounts, resourcePackReasonDisconnectCounts, memoryTierFailures,
-                missingMemoryTierByPlatform);
+                missingMemoryTierByPlatform, rejectedSelectionCounts);
     }
 
     private static String sessionContext(SessionDeviceSnapshot snapshot) {
@@ -184,11 +192,15 @@ final class DeviceProfileRuntime {
                 ? "unknown" : snapshot.withinBudget() ? "fits" : "exceeded";
         String atlasFit = !snapshot.atlasMetricsComplete()
                 ? "unknown" : snapshot.withinStackAtlasPolicy() ? "fits" : "exceeded";
+        String handleFit = !snapshot.textureHandleMetricsComplete()
+                ? "unknown" : snapshot.withinTextureHandleLimit()
+                        ? "within Fettle's 4,000-handle estimate policy"
+                        : "above Fettle's 4,000-handle estimate policy";
         return "platform " + (platform == null ? "unknown" : platform) + ", protocol " + protocolVersion + gameVersion
                 + ", graphics mode " + graphicsMode + ", MemoryTier " + memoryTier
                 + ", selected profiles " + selectedProfileSet(snapshot)
                 + ", pack files " + (packFileCountComplete ? Long.toString(packFiles) : "partial (~" + packFiles + ")")
-                + ", budget " + memoryBudgetFit + ", atlas policy " + atlasFit;
+                + ", budget " + memoryBudgetFit + ", atlas policy " + atlasFit + ", texture handles " + handleFit;
     }
 
     private static String protocolVersionLabel(int protocolVersion) {
@@ -227,7 +239,8 @@ final class DeviceProfileRuntime {
             Map<String, Long> preInitializationDisconnectCounts,
             Map<String, Long> resourcePackReasonDisconnectCounts,
             Map<MemoryTierClaimStatus, Integer> memoryTierFailures,
-            Map<String, Integer> missingMemoryTierByPlatform) {
+            Map<String, Integer> missingMemoryTierByPlatform,
+            Map<DeviceProfilePolicy.Status, Long> rejectedSelectionCounts) {
         Summary {
             profileSets = Collections.unmodifiableMap(new TreeMap<>(profileSets));
             memoryTiers = Collections.unmodifiableMap(new TreeMap<>(memoryTiers));
@@ -243,6 +256,9 @@ final class DeviceProfileRuntime {
             memoryTierFailures = Collections.unmodifiableMap(failures);
             missingMemoryTierByPlatform = Collections.unmodifiableMap(new TreeMap<>(missingMemoryTierByPlatform));
             selectionOutcomes = Collections.unmodifiableMap(new TreeMap<>(selectionOutcomes));
+            EnumMap<DeviceProfilePolicy.Status, Long> rejected = new EnumMap<>(DeviceProfilePolicy.Status.class);
+            rejected.putAll(rejectedSelectionCounts);
+            rejectedSelectionCounts = Collections.unmodifiableMap(rejected);
         }
     }
 }

@@ -114,6 +114,8 @@ public class PackAuditor {
         var rootPackIconCount = 0
         var rootPackIconDimensions: Dimensions? = null
         var opaqueBedrockArchivePresent = false
+        var duplicateEntryCount = 0
+        val entryNames = HashSet<String>()
         var textureReferences = TextureReferenceScan(emptySet(), emptySet(), emptySet(), 0, false, false)
 
         ZipFile(pack.toFile()).use { zip ->
@@ -123,6 +125,7 @@ public class PackAuditor {
                 val entry = entries.nextElement()
                 if (entry.isDirectory) continue
                 if (++fileCount > MAX_FILE_COUNT) throw IOException("Pack has more than $MAX_FILE_COUNT files")
+                if (!entryNames.add(entry.name)) duplicateEntryCount++
                 if (entry.size >= 0L) {
                     uncompressedBytes = try {
                         Math.addExact(uncompressedBytes, entry.size)
@@ -296,6 +299,9 @@ public class PackAuditor {
                 "$blockModelFilesOver50Cubes block model files exceed"
             warnings += "$modelFiles 50 cubes (maximum: $maxBlockModelCubes). Microsoft's warning applies to custom block models placed often."
         }
+        if (duplicateEntryCount > 0) {
+            warnings += "$duplicateEntryCount duplicate ZIP entry names make this pack unsupported for optimization."
+        }
 
         return PackAuditReport(
             archiveBytes = Files.size(pack),
@@ -328,6 +334,7 @@ public class PackAuditor {
             itemAtlasTextureMemoryBytes = itemAtlasTextureMemoryBytes,
             blockAtlasTextureMemoryBytes = blockAtlasTextureMemoryBytes,
             opaqueBedrockArchivePresent = opaqueBedrockArchivePresent,
+            optimizationUnsupported = duplicateEntryCount > 0,
         )
     }
 

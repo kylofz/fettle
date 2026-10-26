@@ -37,7 +37,138 @@ class DeviceProfilePolicyTest {
     }
 
     @Test
-    void actualNonSplitScaffoldingProfileCostsIncludeRoundedAtlasAllocation() {
+    void equalCostProfileCombinationsPreferEarlierPackDeterministically() {
+        UUID first = UUID.fromString("00000000-0000-0000-0000-000000000001");
+        UUID second = UUID.fromString("00000000-0000-0000-0000-000000000002");
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = new LinkedHashMap<>();
+        variants.put(second, Map.of(PackProfile.FULL, audit(80), PackProfile.SAFE, audit(60)));
+        variants.put(first, Map.of(PackProfile.FULL, audit(60), PackProfile.SAFE, audit(40)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 120L),
+                0, 0, true);
+
+        assertEquals(PackProfile.FULL, selection.profiles().get(first));
+        assertEquals(PackProfile.SAFE, selection.profiles().get(second));
+    }
+
+    @Test
+    void automaticSelectionUsesAValidatedLowerFileCountVariant() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, auditWithFileCount(50, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT + 1),
+                PackProfile.SAFE, auditWithFileCount(50, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L), 0, 0, true);
+
+        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
+        assertEquals(DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, selection.requiredPackFileCount());
+        assertTrue(selection.withinPackFileLimit());
+        assertTrue(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void autoRejectsEveryCandidateWhenRequiredStackExceedsFileCountPolicy() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, auditWithFileCount(50, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT + 1),
+                PackProfile.SAFE, auditWithFileCount(10, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT + 1)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L), 0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.withinPackFileLimit());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void autoAllowsAnAddonAboveRecommendationButRejectsTheEngineLimitBoundary() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, auditWithHandleCount(20, DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT + 1),
+                PackProfile.SAFE, auditWithHandleCount(10, DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT)));
+
+        DeviceProfilePolicy.Selection boundary = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L), 0, 0, true);
+
+        assertEquals(PackProfile.SAFE, boundary.profiles().get(id));
+        assertEquals(DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT, boundary.estimatedTextureHandleUpperBound());
+        assertTrue(boundary.withinTextureHandleLimit());
+        assertTrue(boundary.satisfiesPolicy());
+    }
+
+    @Test
+    void autoAcceptsAnEstimateAbovePerAddonGuidanceButBelowEngineLimit() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, auditWithHandleCount(10, 1_152)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 100L), 0, 0, true);
+
+        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
+        assertTrue(selection.withinTextureHandleLimit());
+        assertTrue(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void autoDoesNotSelectAnyVariantWhenEveryCandidateExceedsTextureHandleLimit() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, auditWithHandleCount(20, DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT + 1),
+                PackProfile.SAFE, auditWithHandleCount(10, DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT + 2)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L), 0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.withinTextureHandleLimit());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void fixedPackHandleEstimateCountsTowardTheWholeStackLimit() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, auditWithHandleCount(10, 1_001)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L),
+                0, 0, true, List.of(), 0, 0, true,
+                0, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, 3_000, true,
+                DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(3_000, selection.estimatedTextureHandleUpperBound());
+        assertFalse(selection.withinTextureHandleLimit());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void incompleteFixedPackHandleEstimateCannotQualifyAnAutomaticStack() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, auditWithHandleCount(10, 100)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 100L),
+                0, 0, true, List.of(), 0, 0, true,
+                0, DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, 0, false,
+                DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
+        assertFalse(selection.textureHandleMetricsComplete());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void actualNonSplitScaffoldingProfileCostsKeepTextureAndAtlasEstimatesSeparate() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
                 PackProfile.FULL, audit(1176 * MIB, 1083 * MIB),
@@ -55,10 +186,10 @@ class DeviceProfilePolicyTest {
                 variants, Map.of(4, 1200 * MIB), 0, 0, true);
 
         assertEquals(PackProfile.OPTIMIZE_MINI, tier3.profiles().get(id));
-        assertEquals(245 * MIB, tier3.estimatedResourceMemoryBytes());
+        assertEquals(117 * MIB, tier3.estimatedTextureBytes());
         assertTrue(tier3.withinBudget());
         assertEquals(PackProfile.OPTIMIZE_MINI, iosTier4.profiles().get(id));
-        assertEquals(245 * MIB, iosTier4.estimatedResourceMemoryBytes());
+        assertEquals(117 * MIB, iosTier4.estimatedTextureBytes());
         assertEquals(114 * MIB, iosTier4.estimatedItemAtlasTextureBytes());
         assertTrue(iosTier4.atlasMetricsComplete());
         assertTrue(iosTier4.withinStackAtlasPolicy());
@@ -86,13 +217,13 @@ class DeviceProfilePolicyTest {
         assertEquals(PackProfile.SAFE, selection.profiles().get(id));
         assertEquals(selection.profiles(), nonIos.profiles());
         assertEquals(300 * MIB, selection.textureBudgetBytes());
-        assertEquals(100 * MIB, selection.estimatedResourceMemoryBytes());
+        assertEquals(100 * MIB, selection.estimatedTextureBytes());
         assertFalse(selection.budgetKnown());
         assertFalse(selection.withinBudget());
     }
 
     @Test
-    void tierBudgetIncludesRoundedAtlasAllocationNotOnlyDecodedImageBytes() {
+    void textureBudgetAndAtlasPolicyAreAppliedAsSeparateMeasurements() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
                 PackProfile.FULL, audit(600 * MIB, 200 * MIB),
@@ -103,8 +234,9 @@ class DeviceProfilePolicyTest {
                 PackProfile.AUTO, null, capabilities(2), variants, Map.of(2, 300 * MIB),
                 0, 0, true);
 
-        assertEquals(PackProfile.OPTIMIZE_MINI, selection.profiles().get(id));
-        assertEquals(214 * MIB, selection.estimatedResourceMemoryBytes());
+        assertEquals(PackProfile.OPTIMIZE_SEMI, selection.profiles().get(id));
+        assertEquals(200 * MIB, selection.estimatedTextureBytes());
+        assertEquals(100 * MIB, selection.estimatedItemAtlasTextureBytes());
         assertTrue(selection.withinBudget());
     }
 
@@ -195,7 +327,7 @@ class DeviceProfilePolicyTest {
     }
 
     @Test
-    void incompleteFixedAtlasDoesNotAllowMeasuredTargetAtlasToExceedTheHardLimit() {
+    void incompleteFixedAtlasCannotProduceAnAutomaticSelection() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
                 PackProfile.FULL, audit(100 * MIB, 300 * MIB),
@@ -208,7 +340,9 @@ class DeviceProfilePolicyTest {
                 PackProfile.AUTO, null, capabilities(4), variants, Map.of(4, 1200 * MIB),
                 0, 0, true, List.of(), 0, 0, false);
 
-        assertEquals(PackProfile.OPTIMIZE_MINI, selection.profiles().get(id));
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
+        assertFalse(selection.satisfiesPolicy());
         assertFalse(selection.atlasMetricsComplete());
         assertFalse(selection.withinStackAtlasPolicy());
         assertFalse(selection.withinBudget());
@@ -255,7 +389,7 @@ class DeviceProfilePolicyTest {
     }
 
     @Test
-    void whenNoVariantFitsItSelectsTheSmallestMeasuredSetAndReportsTheOverage() {
+    void whenNoVariantFitsItReturnsOverBudgetWithoutSelectingAnyPack() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
                 PackProfile.FULL, audit(800 * MIB),
@@ -266,9 +400,142 @@ class DeviceProfilePolicyTest {
                 PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
                 0, 0, true);
 
-        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
-        assertEquals(100 * MIB, selection.estimatedTextureBytes());
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+        assertFalse(selection.profiles().containsValue(PackProfile.FULL));
         assertFalse(selection.withinBudget());
+    }
+
+    @Test
+    void unknownTierWithIncompleteFixedPackCostsCannotSelectFull() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, audit(120 * MIB),
+                PackProfile.SAFE, audit(40 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(null), variants, Map.of(),
+                10 * MIB, 0, false);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void unknownTierUsesItsOwnConfiguredBudget() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, audit(70 * MIB),
+                PackProfile.SAFE, audit(40 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(null), variants,
+                Map.of(DeviceProfilePolicy.UNKNOWN_TIER_CONFIG_KEY, 50 * MIB), 0, 0, true);
+
+        assertEquals(50 * MIB, selection.textureBudgetBytes());
+        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
+        assertTrue(selection.satisfiesPolicy());
+        assertFalse(selection.profiles().containsValue(PackProfile.FULL));
+    }
+
+    @Test
+    void unknownTierDoesNotInheritAHighTierBudget() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, audit(1000 * MIB),
+                PackProfile.OPTIMIZE_FULL, audit(700 * MIB),
+                PackProfile.OPTIMIZE_SEMI, audit(500 * MIB),
+                PackProfile.OPTIMIZE_MINI, audit(350 * MIB),
+                PackProfile.SAFE, audit(200 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(null), variants, Map.of(4, 1200 * MIB),
+                0, 0, true);
+
+        assertEquals(300 * MIB, selection.textureBudgetBytes());
+        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
+        assertFalse(selection.budgetKnown());
+        assertTrue(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void unknownTierHonorsALowerConfiguredTierBudget() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, audit(1000 * MIB),
+                PackProfile.SAFE, audit(200 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(null), variants,
+                Map.of(0, 100 * MIB, 4, 1200 * MIB), 0, 0, true);
+
+        assertEquals(100 * MIB, selection.textureBudgetBytes());
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void invalidSafeVariantDoesNotTurnAnOverBudgetFullPackIntoSuccess() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.FULL, audit(800 * MIB),
+                PackProfile.SAFE, unsupportedButMeasuredAudit(10 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
+                0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void incompleteTextureHandleScanCannotQualifyAnAutomaticVariant() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, auditWithIncompleteHandleScan(10 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
+                0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void modelComplexitySkippedByTheBoundedScannerCannotQualifyAnAutomaticVariant() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, auditWithOversizedModel(10 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
+                0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
+    void unsupportedOnlyCandidateHasAnUnsupportedResult() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
+                PackProfile.SAFE, PackAuditReport.unsupported("encrypted pack")));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
+                0, 0, true);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNSUPPORTED, selection.status());
+        assertFalse(selection.satisfiesPolicy());
     }
 
     @Test
@@ -283,8 +550,8 @@ class DeviceProfilePolicyTest {
                 PackProfile.AUTO, null, capabilities(0), variants, Map.of(0, 50 * MIB),
                 0, 0, true);
 
-        assertEquals(PackProfile.FULL, selection.profiles().get(id));
-        assertEquals(800 * MIB, selection.estimatedTextureBytes());
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
         assertFalse(selection.metricsComplete());
         assertFalse(selection.withinBudget());
     }
@@ -300,7 +567,8 @@ class DeviceProfilePolicyTest {
                 PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 450 * MIB),
                 50 * MIB, 0, false);
 
-        assertEquals(PackProfile.FULL, selection.profiles().get(id));
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED, selection.status());
         assertFalse(selection.metricsComplete());
         assertFalse(selection.withinBudget());
     }
@@ -368,6 +636,30 @@ class DeviceProfilePolicyTest {
     }
 
     @Test
+    void automaticSearchStopsAtTheBoundedParetoFrontierWithoutPickingAPartialResult() {
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = new LinkedHashMap<>();
+        long weight = 1;
+        for (int index = 0; index < 6; index++, weight *= 5) {
+            Map<PackProfile, PackAuditReport> profiles = new java.util.EnumMap<>(PackProfile.class);
+            profiles.put(PackProfile.SAFE, auditWithHandleCount(0, (int) (4 * weight)));
+            profiles.put(PackProfile.OPTIMIZE_MINI, auditWithHandleCount(weight, (int) (3 * weight)));
+            profiles.put(PackProfile.OPTIMIZE_SEMI, auditWithHandleCount(2 * weight, (int) (2 * weight)));
+            profiles.put(PackProfile.OPTIMIZE_FULL, auditWithHandleCount(3 * weight, (int) weight));
+            profiles.put(PackProfile.FULL, auditWithHandleCount(4 * weight, 0));
+            variants.put(UUID.randomUUID(), profiles);
+        }
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, Map.of(3, 1_000_000L),
+                0, 0, true, List.of(), 0, 0, true,
+                0, 100_000, 0, true, 100_000);
+
+        assertTrue(selection.profiles().isEmpty());
+        assertEquals(DeviceProfilePolicy.Status.SEARCH_LIMIT, selection.status());
+        assertFalse(selection.satisfiesPolicy());
+    }
+
+    @Test
     void explicitAdminProfileOverridesAutomaticSelection() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(
@@ -397,6 +689,35 @@ class DeviceProfilePolicyTest {
         return audit(textureBytes, true);
     }
 
+    private static PackAuditReport auditWithIncompleteHandleScan(long textureBytes) {
+        return new PackAuditReport(
+                0, 0, 1, 0, 1, textureBytes,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                0, 0, null,
+                true, true, false, 0, 0, List.of());
+    }
+
+    private static PackAuditReport auditWithOversizedModel(long textureBytes) {
+        return new PackAuditReport(
+                0, 0, 1, 0, 1, textureBytes,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                1, 0, null,
+                true, true, true, 0, 0, List.of(),
+                List.of(), 1, 0, 0, 0, 0);
+    }
+
+    private static PackAuditReport unsupportedButMeasuredAudit(long textureBytes) {
+        return new PackAuditReport(
+                0, 0, 1, 0, 1, textureBytes,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                0, 0, null,
+                true, true, true, 0, 0, List.of(),
+                List.of(), 0, 0, 0, 0, 0, false, true);
+    }
+
     private static PackAuditReport audit(long textureBytes, boolean complete) {
         return new PackAuditReport(
                 0, 0, 1, 0, 1, textureBytes,
@@ -414,5 +735,23 @@ class DeviceProfilePolicyTest {
                 0, 0, null,
                 true, true, true, 0, 0, List.of(),
                 List.of(), 0, 0, 0, itemAtlasBytes, 0);
+    }
+
+    private static PackAuditReport auditWithHandleCount(long textureBytes, int handleCount) {
+        return new PackAuditReport(
+                0, 0, 1, handleCount, 1, textureBytes,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                0, 0, null,
+                true, true, true, 0, 0, List.of());
+    }
+
+    private static PackAuditReport auditWithFileCount(long textureBytes, int fileCount) {
+        return new PackAuditReport(
+                0, 0, fileCount, 0, 0, textureBytes,
+                null, 0, 0, 0,
+                null, 0, 0, 0,
+                0, 0, null,
+                true, true, true, 0, 0, List.of());
     }
 }

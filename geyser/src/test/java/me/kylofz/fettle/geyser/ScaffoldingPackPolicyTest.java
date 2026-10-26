@@ -55,6 +55,40 @@ class ScaffoldingPackPolicyTest {
     }
 
     @Test
+    void usesMeasuredFeasibilityAndPrefersFullOnlyWhenItFits() {
+        ResourcePack full = pack(ScaffoldingPackPolicy.ANIMATED_PACK);
+        ResourcePack simple = pack(ScaffoldingPackPolicy.SIMPLE_PACK);
+        List<ResourcePack> packs = List.of(full, simple);
+
+        ScaffoldingPackPolicy.Selection fullPreferred = ScaffoldingPackPolicy.selectByPolicy(packs, true, true);
+        ScaffoldingPackPolicy.Selection simpleRequired = ScaffoldingPackPolicy.selectByPolicy(packs, false, true);
+        ScaffoldingPackPolicy.Selection noFit = ScaffoldingPackPolicy.selectByPolicy(packs, false, false);
+
+        assertEquals(ScaffoldingPackPolicy.AnimationVariant.FULL, fullPreferred.variant());
+        assertSame(full, fullPreferred.selected());
+        assertEquals(ScaffoldingPackPolicy.AnimationVariant.SIMPLE, simpleRequired.variant());
+        assertSame(simple, simpleRequired.selected());
+        assertEquals(ScaffoldingPackPolicy.AnimationVariant.BOTH, noFit.variant());
+        assertNull(noFit.omitted());
+    }
+
+    @Test
+    void reportsTheCombinedReasonWhenNoMeasuredAnimationSetFits() {
+        assertEquals(DeviceProfilePolicy.Status.OVER_BUDGET,
+                FettleExtension.combinedAnimationFailureStatus(
+                        DeviceProfilePolicy.Status.OVER_BUDGET, DeviceProfilePolicy.Status.OVER_BUDGET));
+        assertEquals(DeviceProfilePolicy.Status.UNMEASURED,
+                FettleExtension.combinedAnimationFailureStatus(
+                        DeviceProfilePolicy.Status.OVER_BUDGET, DeviceProfilePolicy.Status.UNMEASURED));
+        assertEquals(DeviceProfilePolicy.Status.UNSUPPORTED,
+                FettleExtension.combinedAnimationFailureStatus(
+                        DeviceProfilePolicy.Status.OVER_BUDGET, DeviceProfilePolicy.Status.UNSUPPORTED));
+        assertEquals(DeviceProfilePolicy.Status.FAILED,
+                FettleExtension.combinedAnimationFailureStatus(
+                        DeviceProfilePolicy.Status.FAILED, DeviceProfilePolicy.Status.OVER_BUDGET));
+    }
+
+    @Test
     void leavesTheOnlyRegisteredAnimationAlone() {
         ResourcePack simple = pack(ScaffoldingPackPolicy.SIMPLE_PACK);
 

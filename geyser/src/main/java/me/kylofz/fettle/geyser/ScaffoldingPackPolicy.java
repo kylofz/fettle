@@ -41,6 +41,14 @@ final class ScaffoldingPackPolicy {
         return new Selection(AnimationVariant.NONE, null, null);
     }
 
+    static Selection selectByPolicy(Collection<ResourcePack> packs, boolean fullFits, boolean simpleFits) {
+        ResourcePack full = find(packs, ANIMATED_PACK);
+        ResourcePack simple = find(packs, SIMPLE_PACK);
+        if (fullFits && full != null) return new Selection(AnimationVariant.FULL, full, simple);
+        if (simpleFits && simple != null) return new Selection(AnimationVariant.SIMPLE, simple, full);
+        return currentSelection(packs);
+    }
+
     static Selection selectForMemoryTier(Collection<ResourcePack> packs, Integer memoryTier) {
         ResourcePack full = find(packs, ANIMATED_PACK);
         ResourcePack simple = find(packs, SIMPLE_PACK);

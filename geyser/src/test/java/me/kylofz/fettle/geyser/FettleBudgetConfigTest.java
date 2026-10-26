@@ -10,8 +10,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FettleBudgetConfigTest {
@@ -21,6 +24,9 @@ class FettleBudgetConfigTest {
         Properties properties = new Properties();
         properties.setProperty("profile", "auto");
         properties.setProperty("texture-budget-memory-tier-3-mib", "600");
+        properties.setProperty("texture-budget-unknown-mib", "200");
+        UUID matchedPack = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        properties.setProperty("match-pack-uuids", matchedPack.toString());
         try (OutputStream output = Files.newOutputStream(config)) {
             properties.store(output, "tier budget test");
         }
@@ -34,6 +40,26 @@ class FettleBudgetConfigTest {
         @SuppressWarnings("unchecked")
         Map<Integer, Long> budgets = (Map<Integer, Long>) getField(extension, "textureBudgetOverrides");
         assertEquals(600L * 1024L * 1024L, budgets.get(3));
+        assertEquals(200L * 1024L * 1024L, budgets.get(DeviceProfilePolicy.UNKNOWN_TIER_CONFIG_KEY));
+        @SuppressWarnings("unchecked")
+        Set<UUID> packUuids = (Set<UUID>) getField(extension, "matchPackUuids");
+        assertEquals(Set.of(matchedPack), packUuids);
+
+        Method saveConfig = FettleExtension.class.getDeclaredMethod("saveConfig");
+        saveConfig.setAccessible(true);
+        assertTrue((boolean) saveConfig.invoke(extension));
+        Properties saved = new Properties();
+        try (var input = Files.newInputStream(config)) {
+            saved.load(input);
+        }
+        assertEquals("200", saved.getProperty("texture-budget-unknown-mib"));
+        assertEquals(matchedPack.toString(), saved.getProperty("match-pack-uuids"));
+    }
+
+    @Test
+    void rejectsNoncanonicalPackUuidRules() {
+        assertThrows(IllegalArgumentException.class,
+                () -> FettleExtension.parseMatchPackUuids("not-a-uuid"));
     }
 
     private static void setField(Object target, String name, Object value) throws Exception {

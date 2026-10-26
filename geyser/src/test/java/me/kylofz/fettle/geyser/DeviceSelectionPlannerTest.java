@@ -122,13 +122,13 @@ class DeviceSelectionPlannerTest {
                 PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI,
                 PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI});
         assertAutomaticProfiles(splitFullSet, List.of(base, animated), new PackProfile[]{
-                PackProfile.SAFE, PackProfile.SAFE, PackProfile.SAFE,
+                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI,
                 PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI});
         assertAutomaticProfiles(splitSimpleSet, List.of(base, animatedSimple), new PackProfile[]{
-                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_MINI,
-                PackProfile.OPTIMIZE_MINI, PackProfile.OPTIMIZE_SEMI});
-        assertUnknownIosProfile(splitFullSet, List.of(base, animated), PackProfile.SAFE);
-        assertUnknownIosProfile(splitSimpleSet, List.of(base, animatedSimple), PackProfile.OPTIMIZE_MINI);
+                PackProfile.OPTIMIZE_SEMI, PackProfile.OPTIMIZE_SEMI, PackProfile.OPTIMIZE_SEMI,
+                PackProfile.OPTIMIZE_SEMI, PackProfile.OPTIMIZE_SEMI});
+        assertUnknownIosProfile(splitFullSet, List.of(base, animated), PackProfile.OPTIMIZE_MINI);
+        assertUnknownIosProfile(splitSimpleSet, List.of(base, animatedSimple), PackProfile.OPTIMIZE_SEMI);
     }
 
     private static PackSetAudit measuredSet(
@@ -180,6 +180,8 @@ class DeviceSelectionPlannerTest {
         assertEquals(300 * MIB, selection.textureBudgetBytes());
         assertFalse(selection.budgetKnown());
         assertFalse(selection.withinBudget());
+        assertTrue(selection.satisfiesPolicy());
+        assertEquals(DeviceProfilePolicy.Status.DEGRADED, selection.status());
         assertTrue(selection.atlasMetricsComplete());
         assertTrue(selection.withinStackAtlasPolicy());
         linkedPacks.forEach(id -> assertEquals(expected, selection.profiles().get(id)));

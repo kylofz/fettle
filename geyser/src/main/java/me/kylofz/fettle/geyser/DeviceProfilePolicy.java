@@ -15,11 +15,17 @@ import java.util.UUID;
 final class DeviceProfilePolicy {
     private static final long MIB = 1024L * 1024L;
     private static final long DEFAULT_UNKNOWN_TIER_BUDGET = 300L * MIB;
-    // Fettle applies Creator Tools' per-pack threshold to the summed required-pack stack conservatively.
+    static final int UNKNOWN_TIER_CONFIG_KEY = -1;
+    static final int AUTO_PACK_FILE_LIMIT = PackAuditReport.MOJANG_HIGH_PACK_FILE_COUNT;
+    static final int AUTO_TEXTURE_HANDLE_LIMIT = PackAuditReport.MINECRAFT_TEXTURE_HANDLE_LIMIT;
+    private static final int MAX_PARETO_STATES = 4_096;
+    // Fettle applies Creator Tools' per-pack thresholds to the full required-pack stack conservatively.
     private static final long STACK_ATLAS_POLICY_LIMIT_BYTES = PackAuditReport.CREATOR_TOOLS_ATLAS_MEMORY_HARD_LIMIT_BYTES;
     private static final List<PackProfile> QUALITY_ORDER = List.of(
             PackProfile.FULL, PackProfile.OPTIMIZE_FULL, PackProfile.OPTIMIZE_SEMI,
             PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
+
+    enum Status { READY, DEGRADED, PREPARING, UNMEASURED, UNSUPPORTED, OVER_BUDGET, SEARCH_LIMIT, FAILED }
 
     private DeviceProfilePolicy() {
     }
@@ -65,6 +71,51 @@ final class DeviceProfilePolicy {
             long fixedItemAtlasTextureMemoryBytes,
             long fixedBlockAtlasTextureMemoryBytes,
             boolean fixedAtlasMetricsComplete) {
+        return selectAll(configured, playerOverride, capabilities, variants, textureBudgetOverrides,
+                fixedTextureMemoryBytes, fixedTextureFileCount, fixedMetricsComplete, linkedProfileGroups,
+                fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
+                0, AUTO_PACK_FILE_LIMIT);
+    }
+
+    static Selection selectAll(
+            PackProfile configured,
+            PackProfile playerOverride,
+            BedrockDeviceCapabilities capabilities,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variants,
+            Map<Integer, Long> textureBudgetOverrides,
+            long fixedTextureMemoryBytes,
+            long fixedTextureFileCount,
+            boolean fixedMetricsComplete,
+            List<Set<UUID>> linkedProfileGroups,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
+            long fixedPackFileCount,
+            long maxPackFileCount) {
+        return selectAll(configured, playerOverride, capabilities, variants, textureBudgetOverrides,
+                fixedTextureMemoryBytes, fixedTextureFileCount, fixedMetricsComplete, linkedProfileGroups,
+                fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
+                fixedPackFileCount, maxPackFileCount, 0, true, AUTO_TEXTURE_HANDLE_LIMIT);
+    }
+
+    static Selection selectAll(
+            PackProfile configured,
+            PackProfile playerOverride,
+            BedrockDeviceCapabilities capabilities,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variants,
+            Map<Integer, Long> textureBudgetOverrides,
+            long fixedTextureMemoryBytes,
+            long fixedTextureFileCount,
+            boolean fixedMetricsComplete,
+            List<Set<UUID>> linkedProfileGroups,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
+            long fixedPackFileCount,
+            long maxPackFileCount,
+            long fixedTextureHandleUpperBound,
+            boolean fixedHandleMetricsComplete,
+            long maxTextureHandleCount) {
         List<UUID> packIds = variants == null ? List.of() : variants.keySet().stream()
                 .sorted(Comparator.comparing(UUID::toString))
                 .toList();
@@ -83,29 +134,42 @@ final class DeviceProfilePolicy {
             packIds.forEach(id -> selected.put(id, fixed));
             return summarize(selected, variants, budget, fixedTextureMemoryBytes, fixedTextureFileCount,
                     fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
-                    fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete);
+                    fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
+                    maxPackFileCount, fixedTextureHandleUpperBound, fixedHandleMetricsComplete,
+                    maxTextureHandleCount);
+        }
+
+        if (!fixedMetricsComplete || !fixedAtlasMetricsComplete) {
+            return summarize(Map.of(), variants, 0, fixedTextureMemoryBytes, fixedTextureFileCount,
+                    fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
+                    fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
+                    maxPackFileCount, fixedTextureHandleUpperBound, fixedHandleMetricsComplete,
+                    maxTextureHandleCount).withStatus(Status.UNMEASURED);
+        }
+
+        if (!fixedHandleMetricsComplete) {
+            return summarize(Map.of(), variants, 0, fixedTextureMemoryBytes, fixedTextureFileCount,
+                    fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
+                    fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
+                    maxPackFileCount, fixedTextureHandleUpperBound, false, maxTextureHandleCount)
+                    .withStatus(Status.UNMEASURED);
         }
 
         long selectionBudget = budgetKnown ? budget : conservativeUnknownTierBudget(textureBudgetOverrides);
-        boolean fixedAtlasWithinLimit = fixedItemAtlasTextureMemoryBytes <= STACK_ATLAS_POLICY_LIMIT_BYTES
-                && fixedBlockAtlasTextureMemoryBytes <= STACK_ATLAS_POLICY_LIMIT_BYTES;
-        // Incomplete fixed-pack scans still provide a lower bound; don't stack measured target atlases past the hard cap.
-        long availableItemAtlas = Math.max(0, STACK_ATLAS_POLICY_LIMIT_BYTES - Math.max(0, fixedItemAtlasTextureMemoryBytes));
-        long availableBlockAtlas = Math.max(0, STACK_ATLAS_POLICY_LIMIT_BYTES - Math.max(0, fixedBlockAtlasTextureMemoryBytes));
-        long fixedResourceMemory = estimatedResourceMemory(
-                Math.max(0, fixedTextureMemoryBytes),
-                Math.max(0, fixedItemAtlasTextureMemoryBytes),
-                Math.max(0, fixedBlockAtlasTextureMemoryBytes));
         Map<ResourceUsage, State> states = Map.of(
-                new ResourceUsage(0, 0, 0), new State(0, 0, 0, fixedResourceMemory, null, Map.of()));
+                new ResourceUsage(0, 0, 0, 0, 0), new State(0, 0, 0, Math.max(0, fixedTextureMemoryBytes), null, Map.of()));
         for (List<UUID> unit : profileUnits) {
-            Map<ResourceUsage, State> next = new HashMap<>();
+            Map<ResourceUsage, State> next = new LinkedHashMap<>();
+            boolean searchLimitExceeded = false;
+            search:
             for (Map.Entry<ResourceUsage, State> stateEntry : states.entrySet()) {
                 for (PackProfile candidate : fittingCandidates(unit, variants)) {
                     long candidateBytes = 0;
                     long candidateArchiveBytes = 0;
                     long candidateItemAtlasBytes = 0;
                     long candidateBlockAtlasBytes = 0;
+                    long candidatePackFileCount = 0;
+                    long candidateTextureHandles = 0;
                     int candidateQuality = 0;
                     Map<UUID, PackProfile> candidateProfiles = new LinkedHashMap<>();
                     for (UUID packId : unit) {
@@ -116,6 +180,9 @@ final class DeviceProfilePolicy {
                                 report.getItemAtlasTextureMemoryBytes());
                         candidateBlockAtlasBytes = saturatedAdd(candidateBlockAtlasBytes,
                                 report.getBlockAtlasTextureMemoryBytes());
+                        candidatePackFileCount = saturatedAdd(candidatePackFileCount, report.getFileCount());
+                        candidateTextureHandles = saturatedAdd(
+                                candidateTextureHandles, report.getEstimatedTextureHandleCount());
                         candidateQuality += visualQuality(candidate);
                         candidateProfiles.put(packId, candidate);
                     }
@@ -123,42 +190,63 @@ final class DeviceProfilePolicy {
                     long usedTexture = saturatedAdd(previousUsage.textureBytes(), candidateBytes);
                     long usedItemAtlas = saturatedAdd(previousUsage.itemAtlasBytes(), candidateItemAtlasBytes);
                     long usedBlockAtlas = saturatedAdd(previousUsage.blockAtlasBytes(), candidateBlockAtlasBytes);
-                    long resourceMemory = estimatedResourceMemory(
-                            saturatedAdd(Math.max(0, fixedTextureMemoryBytes), usedTexture),
-                            saturatedAdd(Math.max(0, fixedItemAtlasTextureMemoryBytes), usedItemAtlas),
-                            saturatedAdd(Math.max(0, fixedBlockAtlasTextureMemoryBytes), usedBlockAtlas));
-                    if (resourceMemory > selectionBudget) continue;
-                    if (fixedAtlasMetricsComplete && !fixedAtlasWithinLimit) continue;
-                    if (usedItemAtlas > availableItemAtlas || usedBlockAtlas > availableBlockAtlas) continue;
+                    long usedPackFileCount = saturatedAdd(previousUsage.packFileCount(), candidatePackFileCount);
+                    long usedTextureHandles = saturatedAdd(previousUsage.textureHandleCount(), candidateTextureHandles);
+                    long textureMemory = saturatedAdd(Math.max(0, fixedTextureMemoryBytes), usedTexture);
+                    long itemAtlasMemory = saturatedAdd(Math.max(0, fixedItemAtlasTextureMemoryBytes), usedItemAtlas);
+                    long blockAtlasMemory = saturatedAdd(Math.max(0, fixedBlockAtlasTextureMemoryBytes), usedBlockAtlas);
+                    if (textureMemory > selectionBudget) continue;
+                    if (saturatedAdd(Math.max(0, fixedPackFileCount), usedPackFileCount) > maxPackFileCount) continue;
+                    if (saturatedAdd(Math.max(0, fixedTextureHandleUpperBound), usedTextureHandles)
+                            > maxTextureHandleCount) continue;
+                    if (PackAuditReport.roundedAtlasAllocationBytes(itemAtlasMemory) > STACK_ATLAS_POLICY_LIMIT_BYTES
+                            || PackAuditReport.roundedAtlasAllocationBytes(blockAtlasMemory) > STACK_ATLAS_POLICY_LIMIT_BYTES) continue;
 
                     State previous = stateEntry.getValue();
-                    ResourceUsage usage = new ResourceUsage(usedTexture, usedItemAtlas, usedBlockAtlas);
+                    ResourceUsage usage = new ResourceUsage(
+                            usedTexture, usedItemAtlas, usedBlockAtlas, usedPackFileCount, usedTextureHandles);
                     State incumbent = next.get(usage);
+                    if (incumbent == null && next.size() >= MAX_PARETO_STATES) {
+                        searchLimitExceeded = true;
+                        break search;
+                    }
                     int quality = previous.quality() + candidateQuality;
                     long archiveBytes = saturatedAdd(previous.archiveBytes(), candidateArchiveBytes);
                     long textureBytes = saturatedAdd(previous.textureMemoryBytes(), candidateBytes);
-                    if (better(quality, resourceMemory, archiveBytes, textureBytes, incumbent)) {
-                        next.put(usage, new State(quality, archiveBytes, textureBytes, resourceMemory,
+                    if (better(quality, textureMemory, archiveBytes, textureBytes, incumbent)) {
+                        next.put(usage, new State(quality, archiveBytes, textureBytes, textureMemory,
                                 previous, Map.copyOf(candidateProfiles)));
                     }
                 }
             }
-            if (next.isEmpty()) {
-                return summarize(lowestMemoryProfiles(profileUnits, variants), variants, selectionBudget,
+            if (searchLimitExceeded) {
+                return summarize(Map.of(), variants, selectionBudget,
                         fixedTextureMemoryBytes, fixedTextureFileCount, fixedMetricsComplete, budgetKnown,
-                        fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete);
+                        fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
+                        fixedPackFileCount, maxPackFileCount, fixedTextureHandleUpperBound,
+                        fixedHandleMetricsComplete, maxTextureHandleCount).withStatus(Status.SEARCH_LIMIT);
+            }
+            if (next.isEmpty()) {
+                return summarize(Map.of(), variants, selectionBudget,
+                        fixedTextureMemoryBytes, fixedTextureFileCount, fixedMetricsComplete, budgetKnown,
+                        fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
+                        fixedPackFileCount, maxPackFileCount, fixedTextureHandleUpperBound,
+                        fixedHandleMetricsComplete, maxTextureHandleCount)
+                        .withStatus(noFeasibleStatus(profileUnits, variants));
             }
             states = pruneDominatedStates(next);
         }
 
         State best = states.values().stream()
                 .max(Comparator.comparingInt(State::quality)
-                        .thenComparingLong(state -> -state.estimatedResourceMemoryBytes())
+                        .thenComparingLong(state -> -state.estimatedTextureMemoryBytes())
                         .thenComparingLong(state -> -state.archiveBytes()))
-                .orElse(new State(0, 0, 0, fixedResourceMemory, null, Map.of()));
+                .orElse(new State(0, 0, 0, Math.max(0, fixedTextureMemoryBytes), null, Map.of()));
         return summarize(best.profiles(), variants, selectionBudget, fixedTextureMemoryBytes, fixedTextureFileCount,
                 fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
-                fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete);
+                fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
+                maxPackFileCount, fixedTextureHandleUpperBound, fixedHandleMetricsComplete,
+                maxTextureHandleCount);
     }
 
     static Long parseTextureBudgetMib(String value) {
@@ -172,15 +260,12 @@ final class DeviceProfilePolicy {
     }
 
     private static long conservativeUnknownTierBudget(Map<Integer, Long> budgets) {
-        if (budgets == null || budgets.isEmpty()) return DEFAULT_UNKNOWN_TIER_BUDGET;
-        return budgets.values().stream().filter(value -> value != null && value >= 0)
-                .mapToLong(Long::longValue).min().orElse(DEFAULT_UNKNOWN_TIER_BUDGET);
-    }
-
-    private static long estimatedResourceMemory(long textureBytes, long itemAtlasBytes, long blockAtlasBytes) {
-        return saturatedAdd(textureBytes, saturatedAdd(
-                PackAuditReport.roundedAtlasAllocationBytes(itemAtlasBytes),
-                PackAuditReport.roundedAtlasAllocationBytes(blockAtlasBytes)));
+        Long unknownBudget = budgets == null ? null : budgets.get(UNKNOWN_TIER_CONFIG_KEY);
+        if (unknownBudget != null && unknownBudget >= 0) return unknownBudget;
+        long lowestConfiguredBudget = budgets == null ? DEFAULT_UNKNOWN_TIER_BUDGET
+                : budgets.values().stream().filter(value -> value != null && value >= 0)
+                        .mapToLong(Long::longValue).min().orElse(DEFAULT_UNKNOWN_TIER_BUDGET);
+        return Math.min(DEFAULT_UNKNOWN_TIER_BUDGET, lowestConfiguredBudget);
     }
 
     static boolean fits(PackAuditReport report, long textureBudget) {
@@ -194,11 +279,53 @@ final class DeviceProfilePolicy {
         for (PackProfile profile : QUALITY_ORDER) {
             if (unit.stream().allMatch(id -> variants.getOrDefault(id, Map.of()).containsKey(profile)
                     && fits(variants.get(id).get(profile), Long.MAX_VALUE)
-                    && variants.get(id).get(profile).getAtlasReferenceScanComplete())) {
+                    && variants.get(id).get(profile).getAtlasReferenceScanComplete()
+                    && variants.get(id).get(profile).getTextureHandleScanComplete()
+                    && variants.get(id).get(profile).getOversizedModelCount() == 0
+                    && !variants.get(id).get(profile).getOpaqueBedrockArchivePresent()
+                    && !variants.get(id).get(profile).getOptimizationUnsupported())) {
                 result.add(profile);
             }
         }
         return result;
+    }
+
+    private static Status noFeasibleStatus(
+            List<List<UUID>> units,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variants) {
+        boolean incomplete = false;
+        boolean unsupported = false;
+        for (List<UUID> unit : units) {
+            boolean hasCommonVariant = false;
+            boolean hasCompleteVariant = false;
+            boolean hasOpaqueVariant = false;
+            boolean unitUnsupported = false;
+            for (PackProfile profile : QUALITY_ORDER) {
+                if (!unit.stream().allMatch(id -> variants.getOrDefault(id, Map.of()).containsKey(profile))) continue;
+                hasCommonVariant = true;
+                List<PackAuditReport> reports = unit.stream().map(id -> variants.get(id).get(profile)).toList();
+                if (reports.stream().anyMatch(PackAuditReport::getOptimizationUnsupported)) {
+                    unitUnsupported = true;
+                    continue;
+                }
+                if (reports.stream().anyMatch(PackAuditReport::getOpaqueBedrockArchivePresent)) {
+                    hasOpaqueVariant = true;
+                    continue;
+                }
+                if (reports.stream().allMatch(report -> report.getTextureMetricsComplete()
+                        && report.getAtlasReferenceScanComplete() && report.getTextureHandleScanComplete()
+                        && report.getOversizedModelCount() == 0)) {
+                    hasCompleteVariant = true;
+                } else {
+                    incomplete = true;
+                }
+            }
+            if (!hasCommonVariant) return Status.FAILED;
+            if (!hasCompleteVariant && (hasOpaqueVariant || unitUnsupported)) unsupported = true;
+        }
+        if (unsupported) return Status.UNSUPPORTED;
+        if (incomplete) return Status.UNMEASURED;
+        return Status.OVER_BUDGET;
     }
 
     private static List<List<UUID>> profileUnits(List<UUID> packIds, List<Set<UUID>> groups) {
@@ -228,52 +355,16 @@ final class DeviceProfilePolicy {
         if (!leftRoot.equals(rightRoot)) parent.put(rightRoot, leftRoot);
     }
 
-    private static Map<UUID, PackProfile> lowestMemoryProfiles(
-            List<List<UUID>> units,
-            Map<UUID, Map<PackProfile, PackAuditReport>> variants) {
-        Map<UUID, PackProfile> selected = new LinkedHashMap<>();
-        for (List<UUID> unit : units) {
-            PackProfile profile = null;
-            long bestMemory = Long.MAX_VALUE;
-            long bestArchive = Long.MAX_VALUE;
-            for (PackProfile candidate : fittingCandidates(unit, variants)) {
-                List<PackAuditReport> reports = unit.stream().map(id -> variants.get(id).get(candidate)).toList();
-                long memory = reports.stream().mapToLong(PackAuditReport::getTextureMemoryBytes).reduce(0, DeviceProfilePolicy::saturatedAdd);
-                long itemAtlasMemory = reports.stream().mapToLong(PackAuditReport::getItemAtlasTextureMemoryBytes)
-                        .reduce(0, DeviceProfilePolicy::saturatedAdd);
-                long blockAtlasMemory = reports.stream().mapToLong(PackAuditReport::getBlockAtlasTextureMemoryBytes)
-                        .reduce(0, DeviceProfilePolicy::saturatedAdd);
-                long resourceMemory = estimatedResourceMemory(memory, itemAtlasMemory, blockAtlasMemory);
-                long archive = reports.stream().mapToLong(PackAuditReport::getArchiveBytes).reduce(0, DeviceProfilePolicy::saturatedAdd);
-                if (profile == null || resourceMemory < bestMemory || resourceMemory == bestMemory &&
-                        (visualQuality(candidate) > visualQuality(profile) ||
-                                visualQuality(candidate) == visualQuality(profile) && archive < bestArchive)) {
-                    profile = candidate;
-                    bestMemory = resourceMemory;
-                    bestArchive = archive;
-                }
-            }
-            if (profile == null) {
-                profile = QUALITY_ORDER.stream()
-                        .filter(candidate -> unit.stream().allMatch(id -> variants.getOrDefault(id, Map.of()).containsKey(candidate)))
-                        .findFirst().orElse(PackProfile.FULL);
-            }
-            PackProfile chosen = profile;
-            unit.forEach(id -> selected.put(id, chosen));
-        }
-        return selected;
-    }
-
     private static boolean better(
             int quality,
-            long estimatedResourceMemoryBytes,
+            long estimatedTextureMemoryBytes,
             long archiveBytes,
             long textureBytes,
             State incumbent) {
         if (incumbent == null) return true;
         if (quality != incumbent.quality()) return quality > incumbent.quality();
-        if (estimatedResourceMemoryBytes != incumbent.estimatedResourceMemoryBytes()) {
-            return estimatedResourceMemoryBytes < incumbent.estimatedResourceMemoryBytes();
+        if (estimatedTextureMemoryBytes != incumbent.estimatedTextureMemoryBytes()) {
+            return estimatedTextureMemoryBytes < incumbent.estimatedTextureMemoryBytes();
         }
         if (textureBytes != incumbent.textureMemoryBytes()) return textureBytes < incumbent.textureMemoryBytes();
         return archiveBytes < incumbent.archiveBytes();
@@ -297,7 +388,9 @@ final class DeviceProfilePolicy {
         if (left.quality() < right.quality()
                 || leftUsage.textureBytes() > rightUsage.textureBytes()
                 || leftUsage.itemAtlasBytes() > rightUsage.itemAtlasBytes()
-                || leftUsage.blockAtlasBytes() > rightUsage.blockAtlasBytes()) return false;
+                || leftUsage.blockAtlasBytes() > rightUsage.blockAtlasBytes()
+                || leftUsage.packFileCount() > rightUsage.packFileCount()
+                || leftUsage.textureHandleCount() > rightUsage.textureHandleCount()) return false;
         return left.quality() > right.quality() || left.archiveBytes() <= right.archiveBytes();
     }
 
@@ -322,33 +415,92 @@ final class DeviceProfilePolicy {
             long fixedItemAtlasTextureMemoryBytes,
             long fixedBlockAtlasTextureMemoryBytes,
             boolean fixedAtlasMetricsComplete) {
+        return summarize(selected, variants, budget, fixedTextureMemoryBytes, fixedTextureFileCount,
+                fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
+                fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, 0, AUTO_PACK_FILE_LIMIT);
+    }
+
+    static Selection summarize(
+            Map<UUID, PackProfile> selected,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variants,
+            long budget,
+            long fixedTextureMemoryBytes,
+            long fixedTextureFileCount,
+            boolean fixedMetricsComplete,
+            boolean budgetKnown,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
+            long fixedPackFileCount,
+            long maxPackFileCount) {
+        return summarize(selected, variants, budget, fixedTextureMemoryBytes, fixedTextureFileCount,
+                fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
+                fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
+                maxPackFileCount, 0, true, AUTO_TEXTURE_HANDLE_LIMIT);
+    }
+
+    static Selection summarize(
+            Map<UUID, PackProfile> selected,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variants,
+            long budget,
+            long fixedTextureMemoryBytes,
+            long fixedTextureFileCount,
+            boolean fixedMetricsComplete,
+            boolean budgetKnown,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
+            long fixedPackFileCount,
+            long maxPackFileCount,
+            long fixedTextureHandleUpperBound,
+            boolean fixedHandleMetricsComplete,
+            long maxTextureHandleCount) {
         long textureMemory = Math.max(0, fixedTextureMemoryBytes);
         long textureFileCount = Math.max(0, fixedTextureFileCount);
+        long packFileCount = Math.max(0, fixedPackFileCount);
         long itemAtlasMemory = Math.max(0, fixedItemAtlasTextureMemoryBytes);
         long blockAtlasMemory = Math.max(0, fixedBlockAtlasTextureMemoryBytes);
         boolean complete = fixedMetricsComplete;
         boolean atlasComplete = fixedAtlasMetricsComplete;
+        boolean unsupported = false;
+        TextureHandleEstimate handles = estimateTextureHandles(
+                selected, variants, fixedTextureHandleUpperBound, fixedHandleMetricsComplete);
         for (Map.Entry<UUID, PackProfile> entry : selected.entrySet()) {
             PackAuditReport report = variants == null ? null
                     : variants.getOrDefault(entry.getKey(), Map.of()).get(entry.getValue());
             if (report == null) {
                 complete = false;
             } else {
+                unsupported |= report.getOptimizationUnsupported() || report.getOpaqueBedrockArchivePresent();
                 textureFileCount = saturatedAdd(textureFileCount, report.getTextureFileCount());
+                packFileCount = saturatedAdd(packFileCount, report.getFileCount());
                 textureMemory = saturatedAdd(textureMemory, report.getTextureMemoryBytes());
-                if (!report.getTextureMetricsComplete()) complete = false;
+                if (!report.getTextureMetricsComplete() || !report.getTextureHandleScanComplete()
+                        || report.getOversizedModelCount() > 0 || report.getOptimizationUnsupported()
+                        || report.getOpaqueBedrockArchivePresent()) complete = false;
                 itemAtlasMemory = saturatedAdd(itemAtlasMemory, report.getItemAtlasTextureMemoryBytes());
                 blockAtlasMemory = saturatedAdd(blockAtlasMemory, report.getBlockAtlasTextureMemoryBytes());
                 if (!report.getAtlasReferenceScanComplete() || !report.getTextureMetricsComplete()) atlasComplete = false;
             }
         }
-        long resourceMemory = estimatedResourceMemory(textureMemory, itemAtlasMemory, blockAtlasMemory);
-        return new Selection(Map.copyOf(selected), budget, textureMemory, textureFileCount, complete,
-                budgetKnown, budgetKnown && complete && atlasComplete && resourceMemory <= budget,
-                resourceMemory,
-                itemAtlasMemory, blockAtlasMemory, atlasComplete,
-            atlasComplete && itemAtlasMemory <= STACK_ATLAS_POLICY_LIMIT_BYTES
-                    && blockAtlasMemory <= STACK_ATLAS_POLICY_LIMIT_BYTES);
+        boolean atlasWithinPolicy = atlasComplete
+                && PackAuditReport.roundedAtlasAllocationBytes(itemAtlasMemory) <= STACK_ATLAS_POLICY_LIMIT_BYTES
+                && PackAuditReport.roundedAtlasAllocationBytes(blockAtlasMemory) <= STACK_ATLAS_POLICY_LIMIT_BYTES;
+        boolean withinPackFileLimit = packFileCount <= maxPackFileCount;
+        boolean withinTextureHandleLimit = handles.complete() && handles.upperBound() <= maxTextureHandleCount;
+        boolean satisfiesPolicy = complete && atlasWithinPolicy && textureMemory <= budget
+                && withinPackFileLimit && withinTextureHandleLimit;
+        boolean withinBudget = budgetKnown && complete && textureMemory <= budget;
+        Status status = unsupported ? Status.UNSUPPORTED
+                : !complete || !atlasComplete || !handles.complete() ? Status.UNMEASURED
+                : !satisfiesPolicy ? Status.OVER_BUDGET
+                : !budgetKnown || selected.values().stream().anyMatch(profile -> profile != PackProfile.FULL)
+                        ? Status.DEGRADED : Status.READY;
+        return new Selection(Map.copyOf(selected), budget, textureMemory, textureFileCount,
+                packFileCount, maxPackFileCount, withinPackFileLimit, handles.upperBound(),
+                maxTextureHandleCount, handles.complete(), withinTextureHandleLimit, complete,
+                budgetKnown, withinBudget, itemAtlasMemory, blockAtlasMemory,
+                atlasComplete, atlasWithinPolicy, satisfiesPolicy, status);
     }
 
     static TextureHandleEstimate estimateTextureHandles(
@@ -380,37 +532,65 @@ final class DeviceProfilePolicy {
             long textureBudgetBytes,
             long estimatedTextureBytes,
             long estimatedTextureFileCount,
+            long requiredPackFileCount,
+            long maxPackFileCount,
+            boolean withinPackFileLimit,
+            long estimatedTextureHandleUpperBound,
+            long maxTextureHandleCount,
+            boolean textureHandleMetricsComplete,
+            boolean withinTextureHandleLimit,
             boolean metricsComplete,
             boolean budgetKnown,
             boolean withinBudget,
-            long estimatedResourceMemoryBytes,
             long estimatedItemAtlasTextureBytes,
             long estimatedBlockAtlasTextureBytes,
             boolean atlasMetricsComplete,
-            boolean withinStackAtlasPolicy) {
+            boolean withinStackAtlasPolicy,
+            boolean satisfiesPolicy,
+            Status status) {
+        Selection withStatus(Status status) {
+            boolean selectable = status == Status.READY || status == Status.DEGRADED;
+            boolean measured = metricsComplete && status != Status.UNMEASURED
+                    && status != Status.UNSUPPORTED && status != Status.PREPARING
+                    && status != Status.SEARCH_LIMIT && status != Status.FAILED;
+            boolean atlasMeasured = atlasMetricsComplete && status != Status.UNMEASURED
+                    && status != Status.UNSUPPORTED && status != Status.PREPARING
+                    && status != Status.SEARCH_LIMIT && status != Status.FAILED;
+            boolean hasSelectedPackStack = !profiles.isEmpty();
+            return new Selection(profiles, textureBudgetBytes, estimatedTextureBytes, estimatedTextureFileCount,
+                    requiredPackFileCount, maxPackFileCount, withinPackFileLimit && measured && hasSelectedPackStack,
+                    estimatedTextureHandleUpperBound, maxTextureHandleCount,
+                    textureHandleMetricsComplete && measured,
+                    withinTextureHandleLimit && measured && hasSelectedPackStack,
+                    measured, budgetKnown, withinBudget && measured && hasSelectedPackStack,
+                    estimatedItemAtlasTextureBytes, estimatedBlockAtlasTextureBytes, atlasMeasured,
+                    withinStackAtlasPolicy && atlasMeasured,
+                    satisfiesPolicy && measured && atlasMeasured && selectable, status);
+        }
     }
 
     record TextureHandleEstimate(long upperBound, boolean complete) {
     }
 
-    private record ResourceUsage(long textureBytes, long itemAtlasBytes, long blockAtlasBytes) {
+    private record ResourceUsage(
+            long textureBytes, long itemAtlasBytes, long blockAtlasBytes, long packFileCount, long textureHandleCount) {
     }
 
     private static final class State {
         private final int quality;
         private final long archiveBytes;
         private final long textureMemoryBytes;
-        private final long estimatedResourceMemoryBytes;
+        private final long estimatedTextureMemoryBytes;
         private final State previous;
         private final Map<UUID, PackProfile> selectedProfiles;
 
         private State(int quality, long archiveBytes, long textureMemoryBytes,
-                      long estimatedResourceMemoryBytes,
+                      long estimatedTextureMemoryBytes,
                       State previous, Map<UUID, PackProfile> selectedProfiles) {
             this.quality = quality;
             this.archiveBytes = archiveBytes;
             this.textureMemoryBytes = textureMemoryBytes;
-            this.estimatedResourceMemoryBytes = estimatedResourceMemoryBytes;
+            this.estimatedTextureMemoryBytes = estimatedTextureMemoryBytes;
             this.previous = previous;
             this.selectedProfiles = selectedProfiles;
         }
@@ -418,7 +598,7 @@ final class DeviceProfilePolicy {
         private int quality() { return quality; }
         private long archiveBytes() { return archiveBytes; }
         private long textureMemoryBytes() { return textureMemoryBytes; }
-        private long estimatedResourceMemoryBytes() { return estimatedResourceMemoryBytes; }
+        private long estimatedTextureMemoryBytes() { return estimatedTextureMemoryBytes; }
 
         private Map<UUID, PackProfile> profiles() {
             Map<UUID, PackProfile> profiles = new LinkedHashMap<>();

@@ -1,8 +1,10 @@
 package me.kylofz.fettle.geyser;
 
 import org.geysermc.geyser.api.pack.PackCodec;
+import org.geysermc.geyser.api.pack.PathPackCodec;
 import org.geysermc.geyser.api.pack.ResourcePack;
 import org.geysermc.geyser.api.pack.ResourcePackManifest;
+import org.geysermc.geyser.api.pack.UrlPackCodec;
 import me.kylofz.fettle.optimizer.PackAuditReport;
 import me.kylofz.fettle.optimizer.PackOptimizationReport;
 import org.junit.jupiter.api.Test;
@@ -26,6 +28,7 @@ import java.security.MessageDigest;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -113,6 +116,45 @@ class PackVariantManagerTest {
         try (Stream<Path> files = Files.list(cacheDirectory)) {
             assertEquals(0L, files.count());
         }
+    }
+
+    @Test
+    void urlPackIsNotDownloadedOrReplacedByALocalCodec() throws Exception {
+        UUID id = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack remote = remotePack(id, "https://packs.example.invalid/required.mcpack");
+        Path cacheDirectory = temporaryDirectory.resolve("remote-pack-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory);
+
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> variants = manager.prepareSet(
+                List.of(remote), PackVariantManager.PREWARM_PROFILES);
+
+        assertEquals(java.util.Set.of(PackProfile.FULL), variants.get(id).keySet());
+        assertSame(remote, variants.get(id).get(PackProfile.FULL).pack());
+        assertTrue(variants.get(id).get(PackProfile.FULL).audit().getOptimizationUnsupported());
+        assertFalse(variants.get(id).get(PackProfile.FULL).audit().getTextureMetricsComplete());
+        try (Stream<Path> files = Files.list(cacheDirectory)) {
+            assertEquals(0, files.count());
+        }
+    }
+
+    @Test
+    void contentKeyPreventsGeneratedVariantsButKeepsTheOriginalPack() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("content-key.mcpack");
+        writePack(sourcePath);
+        UUID id = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, id, new AtomicBoolean(true), List.of(), "content-key");
+        PackVariantManager manager = new PackVariantManager(temporaryDirectory.resolve("content-key-cache"));
+
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> variants = manager.prepareSet(
+                List.of(source), PackVariantManager.PREWARM_PROFILES);
+
+        assertEquals(java.util.Set.of(PackProfile.FULL), variants.get(id).keySet());
+        assertSame(source, variants.get(id).get(PackProfile.FULL).pack());
+        assertTrue(variants.get(id).get(PackProfile.FULL).audit().getTextureMetricsComplete());
+        PackVariantManager.PreparedVariant rejected = manager.prepare(source, PackProfile.OPTIMIZE_SEMI);
+        assertSame(source, rejected.pack());
+        assertNull(rejected.file());
+        assertTrue(rejected.audit().getOptimizationUnsupported());
     }
 
     @Test
@@ -272,6 +314,45 @@ class PackVariantManagerTest {
     }
 
     @Test
+    void partialLinkedPublicationHasNoCompletionRecordAndIsRecoveredAsAWholeSet() throws Exception {
+        UUID firstId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        UUID secondId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
+        Path firstPath = temporaryDirectory.resolve("transaction-first.mcpack");
+        Path secondPath = temporaryDirectory.resolve("transaction-second.mcpack");
+        writePack(firstPath);
+        writePack(secondPath);
+        ResourcePack first = filePack(firstPath, firstId);
+        ResourcePack second = filePack(secondPath, secondId);
+        Path cacheDirectory = temporaryDirectory.resolve("transaction-cache");
+        AtomicInteger generated = new AtomicInteger();
+        PackVariantManager failing = new PackVariantManager(cacheDirectory, path -> {
+            if (generated.incrementAndGet() == 2) throw new IllegalStateException("injected pack factory failure");
+            UUID id = path.getFileName().toString().startsWith(firstId.toString()) ? firstId : secondId;
+            return filePack(path, id);
+        });
+
+        org.junit.jupiter.api.Assertions.assertThrows(Exception.class, () -> failing.prepareSet(
+                List.of(first, second), List.of(PackProfile.OPTIMIZE_SEMI)));
+        try (Stream<Path> files = Files.list(cacheDirectory)) {
+            assertFalse(files.anyMatch(path -> path.getFileName().toString().endsWith(".set-complete")));
+        }
+        assertNull(failing.preparedVariantIfCached(first, PackProfile.OPTIMIZE_SEMI));
+
+        PackVariantManager restarted = new PackVariantManager(cacheDirectory, path -> {
+            UUID id = path.getFileName().toString().startsWith(firstId.toString()) ? firstId : secondId;
+            return filePack(path, id);
+        });
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> recovered = restarted.prepareSet(
+                List.of(first, second), List.of(PackProfile.OPTIMIZE_SEMI));
+
+        assertNotNull(recovered.get(firstId).get(PackProfile.OPTIMIZE_SEMI));
+        assertNotNull(recovered.get(secondId).get(PackProfile.OPTIMIZE_SEMI));
+        try (Stream<Path> files = Files.list(cacheDirectory)) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().endsWith(".set-complete")).count());
+        }
+    }
+
+    @Test
     void keepsPreparedAuditsForTwoSessionSpecificPackStacks() throws Exception {
         UUID baseId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         UUID fullId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
@@ -370,12 +451,13 @@ class PackVariantManagerTest {
             assertTrue(attachable.contains("textures/model/frame"));
         }
         assertTrue(manager.matchesPreparedSet(List.of(base, overlay, fixed), List.of(base, overlay)));
-        assertTrue(manager.matchesPreparedSet(List.of(fixed, overlay, base), List.of(overlay, base)));
+        assertFalse(manager.matchesPreparedSet(List.of(fixed, overlay, base), List.of(overlay, base)));
         java.util.function.Predicate<ResourcePack> targets = pack ->
                 pack.uuid().equals(baseId) || pack.uuid().equals(overlayId);
         PackSetAudit preparedAudit = PackSetAudit.forSession(
                 null, List.of(base, overlay, fixed), targets, manager);
-        assertSame(preparedAudit, PackSetAudit.forSession(
+        assertFalse(preparedAudit.matches(List.of(fixed, overlay, base)));
+        assertNotSame(preparedAudit, PackSetAudit.forSession(
                 preparedAudit, List.of(fixed, overlay, base), targets, manager));
 
         writeEntries(fixedPath, Map.of(
@@ -482,7 +564,7 @@ class PackVariantManagerTest {
     }
 
     @Test
-    void packSetAuditSnapshotMatchesPackIdsAndSourceContentsRegardlessOfOrder() throws Exception {
+    void packSetAuditSnapshotRequiresTheSameEffectivePackOrder() throws Exception {
         UUID targetId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
         UUID fixedId = UUID.fromString("3c3de3ee-beb9-5f70-a3e5-2b99622b1c9f");
         Path targetPath = temporaryDirectory.resolve("target.mcpack");
@@ -496,7 +578,8 @@ class PackVariantManagerTest {
         PackSetAudit snapshot = PackSetAudit.forSession(null, List.of(target, fixed), matcher, null);
 
         assertSame(snapshot, PackSetAudit.forSession(snapshot, List.of(target, fixed), matcher, null));
-        assertSame(snapshot, PackSetAudit.forSession(snapshot, List.of(fixed, target), matcher, null));
+        assertFalse(snapshot.matches(List.of(fixed, target)));
+        assertNotSame(snapshot, PackSetAudit.forSession(snapshot, List.of(fixed, target), matcher, null));
 
         Files.writeString(targetPath, "target-content-changed");
         PackSetAudit changedContent = PackSetAudit.forSession(snapshot, List.of(target, fixed), matcher, null);
@@ -754,20 +837,30 @@ class PackVariantManagerTest {
     }
 
     private ResourcePack filePack(Path path, UUID packId) {
-        return filePack(path, packId, new AtomicBoolean(true), List.of());
+        return filePack(path, packId, new AtomicBoolean(true), List.of(), null);
     }
 
     private ResourcePack filePack(Path path, UUID packId, AtomicBoolean serializationAllowed) {
-        return filePack(path, packId, serializationAllowed, List.of());
+        return filePack(path, packId, serializationAllowed, List.of(), null);
     }
 
     private ResourcePack filePack(Path path, UUID packId, List<UUID> dependencyIds) {
-        return filePack(path, packId, new AtomicBoolean(true), dependencyIds);
+        return filePack(path, packId, new AtomicBoolean(true), dependencyIds, null);
     }
 
     private ResourcePack filePack(
             Path path, UUID packId, AtomicBoolean serializationAllowed, List<UUID> dependencyIds) {
-        PackCodec codec = new PackCodec() {
+        return filePack(path, packId, serializationAllowed, dependencyIds, null);
+    }
+
+    private ResourcePack filePack(Path path, UUID packId, AtomicBoolean serializationAllowed, List<UUID> dependencyIds,
+                                  String contentKey) {
+        PackCodec codec = new PathPackCodec() {
+            @Override
+            public Path path() {
+                return path;
+            }
+
             @Override
             public byte[] sha256() {
                 try {
@@ -807,12 +900,57 @@ class PackVariantManagerTest {
                 new Class<?>[]{ResourcePack.class},
                 (proxy, method, args) -> switch (method.getName()) {
                     case "codec" -> codec;
+                    case "contentKey" -> contentKey == null ? "" : contentKey;
                     case "uuid" -> path.getFileName().toString().startsWith(packId + "-")
                             ? headerUuid(path, packId) : packId;
                     case "manifest" -> testManifest(dependencyIds);
                     case "toString" -> "test-pack:" + packId;
                     case "hashCode" -> System.identityHashCode(proxy);
                     case "equals" -> proxy == args[0];
+                    default -> null;
+                });
+    }
+
+    private static ResourcePack remotePack(UUID packId, String url) {
+        UrlPackCodec codec = new UrlPackCodec() {
+            @Override
+            public byte[] sha256() {
+                throw new AssertionError("URL packs must not be fetched during static preparation");
+            }
+
+            @Override
+            public long size() {
+                throw new AssertionError("URL packs must not be fetched during static preparation");
+            }
+
+            @Override
+            public SeekableByteChannel serialize() {
+                throw new AssertionError("URL packs must not be downloaded during static preparation");
+            }
+
+            @Override
+            public String url() {
+                return url;
+            }
+
+            @Override
+            protected ResourcePack create() {
+                return null;
+            }
+
+            @Override
+            protected ResourcePack.Builder createBuilder() {
+                return null;
+            }
+        };
+        return (ResourcePack) Proxy.newProxyInstance(
+                ResourcePack.class.getClassLoader(),
+                new Class<?>[]{ResourcePack.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "codec" -> codec;
+                    case "uuid" -> packId;
+                    case "contentKey" -> "";
+                    case "manifest" -> testManifest(List.of());
                     default -> null;
                 });
     }

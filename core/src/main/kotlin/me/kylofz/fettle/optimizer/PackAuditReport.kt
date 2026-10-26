@@ -41,6 +41,8 @@ public class PackAuditReport @JvmOverloads constructor(
     public val blockAtlasTextureMemoryBytes: Long = 0,
     /** True when packed Bedrock resources are present but opaque to Fettle's archive scanner. */
     public val opaqueBedrockArchivePresent: Boolean = false,
+    /** True when Fettle cannot safely inspect or rewrite this codec/content identity. */
+    public val optimizationUnsupported: Boolean = false,
 ) {
     public data class TextureHotspot(
         public val path: String,
@@ -56,9 +58,38 @@ public class PackAuditReport @JvmOverloads constructor(
         public const val CREATOR_TOOLS_HIGHEST_RESOLUTION_MIP_WARNING_BYTES: Long = 4L * 1024L * 1024L
         public const val MOJANG_SAFER_PACK_FILE_COUNT: Int = 7_000
         public const val MOJANG_HIGH_PACK_FILE_COUNT: Int = 10_000
+        public const val MINECRAFT_TEXTURE_HANDLE_LIMIT: Int = 4_000
         @Deprecated("Atlas guidance is dimension-based; use CREATOR_TOOLS_ATLAS_MAX_DIMENSION.")
         public const val CREATOR_TOOLS_ATLAS_WARNING_BYTES: Long = 256L * 1024L
         public const val CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE: Int = 800
+
+        @JvmStatic
+        public fun unsupported(reason: String): PackAuditReport = PackAuditReport(
+            archiveBytes = 0,
+            uncompressedBytes = 0,
+            fileCount = 0,
+            estimatedTextureHandleCount = 0,
+            textureFileCount = 0,
+            textureMemoryBytes = 0,
+            largestTexturePath = null,
+            largestTextureWidth = 0,
+            largestTextureHeight = 0,
+            largestTextureMemoryBytes = 0,
+            largestPotentialAtlasTexturePath = null,
+            largestPotentialAtlasTextureMemoryBytes = 0,
+            potentialAtlasTexturesOverBudgetCount = 0,
+            maxTextureDimension = 0,
+            modelFileCount = 0,
+            maxModelCubes = 0,
+            largestModelPath = null,
+            textureMetricsComplete = false,
+            atlasReferenceScanComplete = false,
+            textureHandleScanComplete = false,
+            unmeasuredTextureCount = 0,
+            pngAnimationMetadataCount = 0,
+            warnings = listOf(reason),
+            optimizationUnsupported = true,
+        )
 
         /** Mirrors Creator Tools' atlas allocation estimate: round aggregate texture bytes up to a power of two. */
         @JvmStatic

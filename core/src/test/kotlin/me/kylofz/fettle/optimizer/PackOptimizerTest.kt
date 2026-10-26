@@ -3025,6 +3025,112 @@ class PackOptimizerTest {
         }
     }
 
+    @Test
+    fun lowEndResizingPreservesUiAndPbrResolutionWhileKeepingFontGlyphsReadable() {
+        withTempDirectory { root ->
+            fun png(width: Int, height: Int): ByteArray {
+                val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+                return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            }
+
+            val input = root.resolve("input.mcpack")
+            val output = root.resolve("output.mcpack")
+            writePack(input, mapOf(
+                "textures/blocks/ordinary.png" to png(512, 256),
+                "textures/ui/icon.png" to png(512, 512),
+                "font/glyph_E0.png" to png(512, 512),
+                "textures/model/pbr.png" to png(512, 512),
+                "textures/model/pbr_normal.png" to png(512, 512),
+                "textures/model/pbr_mer.png" to png(512, 512),
+                "textures/model/pbr.texture_set.json" to
+                    """{"format_version":"1.21.30","minecraft:texture_set":{"color":"pbr","normal":"pbr_normal","metalness_emissive_roughness":"pbr_mer"}}""".toByteArray(),
+            ))
+
+            PackOptimizer().optimizeSafe(input, output, 128)
+
+            ZipFile(output.toFile()).use { zip ->
+                fun dimensions(path: String): Pair<Int, Int> = ImageIO.read(zip.getInputStream(zip.getEntry(path))).let {
+                    it.width to it.height
+                }
+                assertEquals(128 to 64, dimensions("textures/blocks/ordinary.png"))
+                assertEquals(512 to 512, dimensions("textures/ui/icon.png"))
+                assertEquals(256 to 256, dimensions("font/glyph_E0.png"))
+                assertEquals(512 to 512, dimensions("textures/model/pbr.png"))
+                assertEquals(512 to 512, dimensions("textures/model/pbr_normal.png"))
+                assertEquals(512 to 512, dimensions("textures/model/pbr_mer.png"))
+            }
+        }
+    }
+
+    @Test
+    fun linkedLosslessOptimizationPreservesTextureSetAssetsAndTheirUvSpace() {
+        withTempDirectory { root ->
+            fun png(size: Int): ByteArray {
+                val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
+                return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            }
+
+            val input = root.resolve("pbr.mcpack")
+            val output = root.resolve("pbr-optimized.mcpack")
+            val resizedOutput = root.resolve("pbr-resized.mcpack")
+            val resizedSetOutput = root.resolve("pbr-resized-set.mcpack")
+            val geometry = """{"minecraft:geometry":[{"description":{"identifier":"geometry.scf.pbr","texture_width":512,"texture_height":512},"bones":[{"name":"root","cubes":[{"origin":[0,0,0],"size":[1,1,1],"uv":{"north":{"uv":[128,128],"uv_size":[64,64]}}}]}]}]}"""
+            val attachable = """{"minecraft:attachable":{"description":{"geometry":{"default":"geometry.scf.pbr"},"textures":{"default":"textures/model/pbr"}}}}"""
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "attachables/pbr.json" to attachable.toByteArray(),
+                "models/entity/pbr.geo.json" to geometry.toByteArray(),
+                "textures/model/pbr.png" to png(512),
+                "textures/model/pbr_normal.png" to png(512),
+                "textures/model/pbr_mer.png" to png(512),
+                "textures/model/pbr.texture_set.json" to
+                    """{"format_version":"1.21.30","minecraft:texture_set":{"color":"pbr","normal":"pbr_normal","metalness_emissive_roughness":"pbr_mer"}}""".toByteArray(),
+            ))
+
+            PackOptimizer().optimizeSafe(input, resizedOutput, 128)
+            PackOptimizer().optimizeForLowEndSet(listOf(input), listOf(output))
+            PackOptimizer().optimizeResizedPackSet(listOf(input), listOf(resizedSetOutput), 128)
+
+            fun assertPbrAssetsAndUvRemainAligned(path: Path) {
+                ZipFile(path.toFile()).use { zip ->
+                    val source = zip.getInputStream(zip.getEntry("textures/model/pbr.png")).use(ImageIO::read)
+                    assertEquals(512 to 512, source.width to source.height)
+                    assertTrue(zip.getEntry("textures/model/pbr.texture_set.json") != null)
+                    val rewrittenGeometry = zip.getInputStream(zip.getEntry("models/entity/pbr.geo.json"))
+                        .use { it.readBytes().decodeToString() }
+                    assertTrue(rewrittenGeometry.contains("\"texture_width\":512"))
+                    assertTrue(rewrittenGeometry.contains("\"uv\":[128,128]"))
+                    assertFalse(zip.entries().asSequence().any { it.name.startsWith("textures/entity/fettle/atlases/") })
+                }
+            }
+            assertPbrAssetsAndUvRemainAligned(resizedOutput)
+            assertPbrAssetsAndUvRemainAligned(output)
+            assertPbrAssetsAndUvRemainAligned(resizedSetOutput)
+        }
+    }
+
+    @Test
+    fun malformedTextureSetPreventsResizingUnclassifiedTextures() {
+        withTempDirectory { root ->
+            val input = root.resolve("input.mcpack")
+            val output = root.resolve("output.mcpack")
+            val image = BufferedImage(512, 256, BufferedImage.TYPE_INT_ARGB)
+            val png = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            writePack(input, mapOf(
+                "textures/blocks/ordinary.png" to png,
+                "textures/model/broken.texture_set.json" to "{broken".toByteArray(),
+            ))
+
+            PackOptimizer().optimizeSafe(input, output, 128)
+
+            ZipFile(output.toFile()).use { zip ->
+                val dimensions = ImageIO.read(zip.getInputStream(zip.getEntry("textures/blocks/ordinary.png")))
+                assertEquals(512, dimensions.width)
+                assertEquals(256, dimensions.height)
+            }
+        }
+    }
+
     private fun writePack(path: Path, entries: Map<String, ByteArray>) {
         ZipOutputStream(Files.newOutputStream(path)).use { zip ->
             entries.forEach { (name, bytes) ->

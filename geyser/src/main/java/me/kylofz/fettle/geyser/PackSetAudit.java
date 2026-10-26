@@ -2,6 +2,7 @@ package me.kylofz.fettle.geyser;
 
 import me.kylofz.fettle.optimizer.PackAuditReport;
 import org.geysermc.geyser.api.pack.ResourcePack;
+import org.geysermc.geyser.api.pack.option.ResourcePackOption;
 
 import java.nio.file.Files;
 import java.util.Collection;
@@ -17,6 +18,7 @@ import java.util.function.Predicate;
 record PackSetAudit(
         List<ResourcePack> allPacks,
         List<String> sourceHashes,
+        Map<UUID, String> packOptionFingerprints,
         List<ResourcePack> targetPacks,
         Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> preparedVariants,
         Map<UUID, Map<PackProfile, PackAuditReport>> variantReports,
@@ -48,7 +50,30 @@ record PackSetAudit(
             long fixedTextureHandleUpperBound,
             boolean fixedMetricsComplete,
             boolean fixedHandleMetricsComplete) {
-        this(allPacks, sourceHashes, targetPacks, preparedVariants, variantReports, fixedPackReports,
+        this(allPacks, sourceHashes, Map.of(), targetPacks, preparedVariants, variantReports, fixedPackReports,
+                linkedProfileGroups, fixedTextureMemoryBytes, fixedTextureFileCount,
+                fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
+                fixedTextureHandleUpperBound, fixedMetricsComplete, fixedHandleMetricsComplete, true);
+    }
+
+    PackSetAudit(
+            List<ResourcePack> allPacks,
+            List<String> sourceHashes,
+            Map<UUID, String> packOptionFingerprints,
+            List<ResourcePack> targetPacks,
+            Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> preparedVariants,
+            Map<UUID, Map<PackProfile, PackAuditReport>> variantReports,
+            Map<UUID, PackAuditReport> fixedPackReports,
+            List<Set<UUID>> linkedProfileGroups,
+            long fixedTextureMemoryBytes,
+            long fixedTextureFileCount,
+            long fixedItemAtlasTextureMemoryBytes,
+            long fixedBlockAtlasTextureMemoryBytes,
+            boolean fixedAtlasMetricsComplete,
+            long fixedTextureHandleUpperBound,
+            boolean fixedMetricsComplete,
+            boolean fixedHandleMetricsComplete) {
+        this(allPacks, sourceHashes, packOptionFingerprints, targetPacks, preparedVariants, variantReports, fixedPackReports,
                 linkedProfileGroups, fixedTextureMemoryBytes, fixedTextureFileCount,
                 fixedItemAtlasTextureMemoryBytes, fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete,
                 fixedTextureHandleUpperBound, fixedMetricsComplete, fixedHandleMetricsComplete, true);
@@ -57,6 +82,7 @@ record PackSetAudit(
     PackSetAudit {
         allPacks = List.copyOf(allPacks);
         sourceHashes = List.copyOf(sourceHashes);
+        packOptionFingerprints = Map.copyOf(packOptionFingerprints);
         targetPacks = List.copyOf(targetPacks);
         linkedProfileGroups = linkedProfileGroups.stream().map(Set::copyOf).toList();
         Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared = new LinkedHashMap<>();
@@ -68,20 +94,37 @@ record PackSetAudit(
         fixedPackReports = Map.copyOf(fixedPackReports);
     }
 
+    long fixedPackFileCount() {
+        long count = 0;
+        for (PackAuditReport report : fixedPackReports.values()) {
+            if (Long.MAX_VALUE - count < report.getFileCount()) return Long.MAX_VALUE;
+            count += report.getFileCount();
+        }
+        return count;
+    }
+
     boolean matches(Collection<ResourcePack> packs) {
+        return matches(packs, Map.of());
+    }
+
+    boolean matches(
+            Collection<ResourcePack> packs,
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> options) {
         if (allPacks.size() != packs.size() || sourceHashes.size() != allPacks.size()) return false;
-        Map<UUID, String> hashesById = new LinkedHashMap<>();
-        for (int index = 0; index < allPacks.size(); index++) {
-            if (hashesById.put(allPacks.get(index).uuid(), sourceHashes.get(index)) != null) return false;
-        }
-        Set<UUID> seen = new HashSet<>();
-        // Geyser can enumerate the same required pack set in a different order at session load.
+        int index = 0;
         for (ResourcePack candidate : packs) {
-            if (!seen.add(candidate.uuid())) return false;
+            ResourcePack prepared = allPacks.get(index);
+            if (!candidate.uuid().equals(prepared.uuid())) return false;
             String currentHash = sourceHash(candidate);
-            if (currentHash.isEmpty() || !currentHash.equals(hashesById.get(candidate.uuid()))) return false;
+            if (currentHash.isEmpty() || !currentHash.equals(sourceHashes.get(index))) return false;
+            Collection<ResourcePackOption<?>> candidateOptions = options == null ? null
+                    : options.get(candidate.uuid());
+            String currentOptions = PackVariantManager.optionFingerprint(
+                    candidateOptions == null ? List.of() : candidateOptions);
+            if (!currentOptions.equals(packOptionFingerprints.getOrDefault(candidate.uuid(), ""))) return false;
+            index++;
         }
-        return seen.size() == hashesById.size();
+        return true;
     }
 
     static PackSetAudit forSession(
@@ -89,11 +132,20 @@ record PackSetAudit(
             Collection<ResourcePack> packs,
             Predicate<ResourcePack> targetMatcher,
             PackVariantManager variantManager) {
+        return forSession(prepared, packs, targetMatcher, variantManager, Map.of());
+    }
+
+    static PackSetAudit forSession(
+            PackSetAudit prepared,
+            Collection<ResourcePack> packs,
+            Predicate<ResourcePack> targetMatcher,
+            PackVariantManager variantManager,
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> packOptions) {
         List<ResourcePack> snapshot = List.copyOf(packs);
-        if (prepared != null && prepared.matches(snapshot)) return prepared;
+        if (prepared != null && prepared.matches(snapshot, packOptions)) return prepared;
 
         List<ResourcePack> targetPacks = snapshot.stream().filter(targetMatcher).toList();
-        return collect(snapshot, targetPacks, targetMatcher, variantManager);
+        return collect(snapshot, targetPacks, targetMatcher, variantManager, packOptions);
     }
 
     List<PackAuditSnapshot> selectedPackAudits(Map<UUID, PackProfile> selectedProfiles) {
@@ -143,17 +195,31 @@ record PackSetAudit(
             List<ResourcePack> targetPacks,
             Predicate<ResourcePack> targetMatcher,
             PackVariantManager variantManager) {
+        return collect(packs, targetPacks, targetMatcher, variantManager, Map.of());
+    }
+
+    static PackSetAudit collect(
+            Collection<ResourcePack> packs,
+            List<ResourcePack> targetPacks,
+            Predicate<ResourcePack> targetMatcher,
+            PackVariantManager variantManager,
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> packOptions) {
         List<ResourcePack> allPacks = List.copyOf(packs);
         targetPacks = List.copyOf(targetPacks);
         List<String> sourceHashes = allPacks.stream().map(PackSetAudit::sourceHash).toList();
         Map<UUID, String> sourceHashesById = new LinkedHashMap<>();
+        Map<UUID, String> optionFingerprintsById = new LinkedHashMap<>();
         for (int index = 0; index < allPacks.size(); index++) {
             sourceHashesById.put(allPacks.get(index).uuid(), sourceHashes.get(index));
+            Collection<ResourcePackOption<?>> options = packOptions == null ? null
+                    : packOptions.get(allPacks.get(index).uuid());
+            optionFingerprintsById.put(allPacks.get(index).uuid(),
+                    PackVariantManager.optionFingerprint(options == null ? List.of() : options));
         }
         Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> preparedVariants = new LinkedHashMap<>();
         Map<UUID, Map<PackProfile, PackAuditReport>> variantReports = new LinkedHashMap<>();
         boolean preparedPackStackMatches = variantManager != null
-                && variantManager.matchesPreparedSet(allPacks, targetPacks, sourceHashesById);
+                && variantManager.matchesPreparedSet(allPacks, targetPacks, sourceHashesById, optionFingerprintsById);
         for (ResourcePack pack : targetPacks) {
             Map<PackProfile, PackVariantManager.PreparedVariant> prepared;
             if (variantManager == null) {
@@ -185,7 +251,8 @@ record PackSetAudit(
             PackVariantManager.PreparedVariant full = variantManager == null
                     ? null : variantManager.preparedVariantIfCached(pack, PackProfile.FULL);
             PackAuditReport report = full == null ? null : full.audit();
-            if (report == null || !report.getTextureMetricsComplete()) fixedMetricsComplete = false;
+            if (report == null || !report.getTextureMetricsComplete() || !report.getTextureHandleScanComplete()
+                    || report.getOversizedModelCount() > 0) fixedMetricsComplete = false;
             if (report == null || !report.getAtlasReferenceScanComplete() || !report.getTextureMetricsComplete()) {
                 fixedAtlasMetricsComplete = false;
             }
@@ -230,7 +297,8 @@ record PackSetAudit(
             }
         }
 
-        return new PackSetAudit(allPacks, sourceHashes, targetPacks, preparedVariants, variantReports, fixedPackReports,
+        return new PackSetAudit(allPacks, sourceHashes, optionFingerprintsById, targetPacks,
+                preparedVariants, variantReports, fixedPackReports,
                 variantManager == null ? List.of() : variantManager.linkedProfileGroups(),
                 fixedTextureMemory, fixedTextureFileCount, fixedItemAtlasTextureMemory,
                 fixedBlockAtlasTextureMemory, fixedAtlasMetricsComplete, fixedTextureHandleUpperBound,

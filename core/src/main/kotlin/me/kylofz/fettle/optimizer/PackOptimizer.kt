@@ -61,6 +61,7 @@ public class PackOptimizer {
         val jsonStringRewrites: Map<String, String> = emptyMap(),
         val generatedEntries: Map<String, ByteArray> = emptyMap(),
         val animatedTextures: Set<String> = emptySet(),
+        val preserveResolutionTextures: Set<String> = emptySet(),
         val unsafeGeometryTextures: Set<String> = emptySet(),
         val unsafeGeometryFiles: Set<String> = emptySet(),
         val disableTextureResizing: Boolean = false,
@@ -555,6 +556,7 @@ public class PackOptimizer {
             jsonStringRewrites = if (extraPlan.disableLocalPruning) emptyMap()
                 else localPlan.jsonStringRewrites + extraPlan.jsonStringRewrites,
             generatedEntries = localPlan.generatedEntries + extraPlan.generatedEntries,
+            preserveResolutionTextures = localPlan.preserveResolutionTextures + extraPlan.preserveResolutionTextures,
             unsafeGeometryTextures = localPlan.unsafeGeometryTextures + extraPlan.unsafeGeometryTextures,
             unsafeGeometryFiles = localPlan.unsafeGeometryFiles + extraPlan.unsafeGeometryFiles,
             disableTextureResizing = localPlan.disableTextureResizing || extraPlan.disableTextureResizing,
@@ -622,12 +624,14 @@ public class PackOptimizer {
                             throw IOException("Duplicate output ZIP entry: $name")
                         }
                         val isPng = name.endsWith(".png", ignoreCase = true)
+                        val preserveResolution = isResolutionSensitiveTexture(name, plan.preserveResolutionTextures)
                         // Whole-image scaling preserves normalized UVs; unresolved links only forbid coupled crops.
                         val resizePng = isPng && name !in animatedTextures &&
+                            (!preserveResolution || maxTextureDimension <= 0) &&
                             (maxTextureDimension <= 0 || !plan.disableTextureResizing &&
                                 (name !in plan.unsafeGeometryTextures || name !in plan.textureCrops)) &&
                             (optimizePng || name in plan.textureCrops)
-                        val isOtherRaster = maxTextureDimension > 0 && isOtherRaster(name)
+                        val isOtherRaster = maxTextureDimension > 0 && isOtherRaster(name) && !preserveResolution
                         val entryTooLargeForTransform = entry.size >= 0L &&
                             ((name.endsWith(".json", ignoreCase = true) && entry.size > MAX_JSON_BYTES) ||
                                 (isPng && entry.size > MAX_PNG_BYTES) ||
@@ -758,6 +762,9 @@ public class PackOptimizer {
         val unsafeGeometryTextures = HashSet<String>()
         val unsafeGeometryFiles = HashSet<String>()
         var scannedBytes = 0L
+        var textureSetScannedBytes = 0L
+        var hasUnresolvedTextureSet = false
+        val preserveResolutionTextures = HashSet<String>()
         var hasUnclassifiedUvAnimation = false
         // shortcut: material references are not schema-validated, so skip destructive pruning when they occur.
         var hasUnresolvedAssetReferences = false
@@ -773,6 +780,27 @@ public class PackOptimizer {
                     if (entry.isDirectory) continue
                     if (++entriesScanned > MAX_ZIP_ENTRIES) return OptimizationPlan(disableTextureResizing = maxTextureDimension > 0)
                     val name = entry.name
+                    if (name.endsWith(".texture_set.json", ignoreCase = true)) {
+                        val bytes = if (entry.size in 0..MAX_JSON_BYTES.toLong()) {
+                            zip.getInputStream(entry).use { readBounded(it, MAX_JSON_BYTES) }
+                        } else null
+                        if (bytes == null || textureSetScannedBytes + bytes.size > MAX_PRUNE_SCAN_BYTES) {
+                            hasUnresolvedTextureSet = true
+                        } else {
+                            textureSetScannedBytes += bytes.size
+                            val strings = decodeUtf8(bytes)?.let(JsonStringScanner::read)
+                            if (strings == null) {
+                                hasUnresolvedTextureSet = true
+                            } else {
+                                strings.mapNotNull(::textureEntryName)
+                                    .mapTo(preserveResolutionTextures) { it.lowercase(Locale.ROOT) }
+                                val stem = name.dropLast(".texture_set.json".length)
+                                preserveResolutionTextures += "$stem.png".lowercase(Locale.ROOT)
+                                preserveResolutionTextures += "${stem}_normal.png".lowercase(Locale.ROOT)
+                                preserveResolutionTextures += "${stem}_mer.png".lowercase(Locale.ROOT)
+                            }
+                        }
+                    }
                     if (name.endsWith(".png", ignoreCase = true) &&
                         (name.startsWith(STITCHED_TEXTURE_PATH, ignoreCase = true) ||
                             name.substringAfterLast('/').endsWith("_stitched.png", ignoreCase = true))
@@ -977,7 +1005,8 @@ public class PackOptimizer {
                         val plannedTextures = ArrayList<Pair<String, TextureCrop>>(textures.size)
                         var supported = true
                         for (texture in textures) {
-                            if (texture in animatedTextures || texture in animatedTextureReferences ||
+                            if (texture.lowercase(Locale.ROOT) in preserveResolutionTextures ||
+                                texture in animatedTextures || texture in animatedTextureReferences ||
                                 directTextureReferences[texture] == null ||
                                 !isDirectTextureOnly(texture, directTextureReferences.getValue(texture), textureReferenceTokens)
                             ) {
@@ -1058,7 +1087,9 @@ public class PackOptimizer {
                     jsonStringRewrites = directDedup.jsonStringRewrites +
                         croppedDedup.jsonStringRewrites + itemDedup.jsonStringRewrites,
                     unsafeGeometryTextures = unsafeGeometryTextures,
-                    disableTextureResizing = maxTextureDimension > 0 && hasUnresolvedAssetReferences,
+                    preserveResolutionTextures = preserveResolutionTextures,
+                    disableTextureResizing = maxTextureDimension > 0 &&
+                        (hasUnresolvedAssetReferences || hasUnresolvedTextureSet),
                 )
             }
         } catch (_: IOException) {
@@ -1110,6 +1141,7 @@ public class PackOptimizer {
             val textureEntrySizes = HashMap<PackEntryKey, Long>()
             val textureKeysByPath = HashMap<String, MutableList<PackEntryKey>>()
             val entryNamesByPack = List(inputs.size) { HashSet<String>() }
+            val preserveResolutionTexturePaths = HashSet<String>()
             val textureReferences = HashMap<PackEntryKey, MutableList<PackSetTextureReference>>()
             val protectedEntries = List(inputs.size) { HashSet<String>() }
             val directTextureReferences = HashMap<PackEntryKey, Int>()
@@ -1157,6 +1189,11 @@ public class PackOptimizer {
                         val key = PackEntryKey(packIndex, name)
                         textureEntrySizes[key] = entry.size
                         textureKeysByPath.getOrPut(name, ::ArrayList).add(key)
+                        val normalizedName = name.lowercase(Locale.ROOT)
+                        if (normalizedName.startsWith("textures/ui/") ||
+                            normalizedName.endsWith("_normal.png") || normalizedName.endsWith("_mer.png")) {
+                            preserveResolutionTexturePaths += normalizedName
+                        }
                     } else if (name.endsWith(".png.mcmeta", ignoreCase = true)) {
                         animatedTextures += PackEntryKey(packIndex, name.dropLast(".mcmeta".length))
                     }
@@ -1175,6 +1212,14 @@ public class PackOptimizer {
                     if (scannedBytes > MAX_PACK_SET_SCAN_BYTES) return emptyPlans()
                     val text = decodeUtf8(bytes) ?: return emptyPlans()
                     val strings = JsonStringScanner.read(text) ?: return emptyPlans()
+                    if (name.endsWith(".texture_set.json", ignoreCase = true)) {
+                        val stem = name.dropLast(".texture_set.json".length)
+                        preserveResolutionTexturePaths += "$stem.png".lowercase(Locale.ROOT)
+                        preserveResolutionTexturePaths += "${stem}_normal.png".lowercase(Locale.ROOT)
+                        preserveResolutionTexturePaths += "${stem}_mer.png".lowercase(Locale.ROOT)
+                        strings.mapNotNull(::textureEntryName)
+                            .mapTo(preserveResolutionTexturePaths) { it.lowercase(Locale.ROOT) }
+                    }
                     if (text.contains("\"uv_anim\"") && !name.startsWith(RENDER_CONTROLLERS_PATH, ignoreCase = true)) {
                         unknownUvAnimation = true
                     }
@@ -1428,7 +1473,8 @@ public class PackOptimizer {
                         references,
                         attachmentTextureMapReferences[textureKey].orEmpty(),
                     )
-                    if (textureKey.path in ambiguousTexturePaths || textureKey in animatedTextures ||
+                    if (textureKey.path.lowercase(Locale.ROOT) in preserveResolutionTexturePaths ||
+                        textureKey.path in ambiguousTexturePaths || textureKey in animatedTextures ||
                         textureKey in animatedTextureReferences ||
                         directTextureReferences[textureKey] == null ||
                         textureKey in unclassifiedRenderControllerTextures ||
@@ -1509,6 +1555,7 @@ public class PackOptimizer {
             val atlasRemovedEntries = List(inputs.size) { HashSet<String>() }
             val atlasRewrites = List(inputs.size) { HashMap<String, String>() }
             val generatedEntries = List(inputs.size) { HashMap<String, ByteArray>() }
+            val protectedTextureAndSetPaths = protectedPaths + preserveResolutionTexturePaths
             val atlasedTextures = if (maxTextureDimension == 0 && cropToUvExtent && protectedTexturePaths != null) {
                 buildLosslessAtlases(
                     atlasCandidates,
@@ -1524,7 +1571,7 @@ public class PackOptimizer {
                     generatedEntries,
                     protectedEntries,
                     unsafeGeometryFiles,
-                    protectedPaths,
+                    protectedTextureAndSetPaths,
                 )
             } else emptySet()
             val croppedDedup = if (cropToUvExtent && maxTextureDimension == 0) {
@@ -1539,7 +1586,7 @@ public class PackOptimizer {
                     ambiguousTexturePaths,
                     animatedTextures,
                     linkedGroupByPack,
-                    protectedPaths,
+                    protectedTextureAndSetPaths,
                     allowCrossPackTextureDedup,
                     protectedEntries,
                     atlasedTextures,
@@ -1573,6 +1620,7 @@ public class PackOptimizer {
                         croppedDedup.jsonStringRewrites[index] + atlasRewrites[index] +
                         geometryDedup.jsonStringRewrites[index],
                     generatedEntries = generatedEntries[index],
+                    preserveResolutionTextures = preserveResolutionTexturePaths,
                     unsafeGeometryTextures = unsafeGeometryTextures[index],
                     unsafeGeometryFiles = unsafeGeometryFiles[index],
                 )
@@ -2765,6 +2813,12 @@ public class PackOptimizer {
             name.endsWith(".tga", ignoreCase = true)
 
     private fun isFontGlyphAtlas(name: String): Boolean = FONT_GLYPH_ATLAS_PATH.matches(name)
+
+    private fun isResolutionSensitiveTexture(name: String, textureSetPaths: Set<String>): Boolean {
+        val lower = name.lowercase(Locale.ROOT)
+        return lower in textureSetPaths || lower.startsWith("textures/ui/") ||
+            lower.endsWith("_normal.png") || lower.endsWith("_mer.png")
+    }
 
     private fun readBounded(input: InputStream, maxBytes: Int): ByteArray? {
         val output = ByteArrayOutputStream(minOf(maxBytes, DEFAULT_BUFFER_SIZE))

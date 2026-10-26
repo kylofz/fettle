@@ -16,14 +16,39 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class FettlePackReplacementTest {
     private static final UUID PACK_ID = UUID.fromString("42ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+
+    @Test
+    void anUnavailableOptimizedProfileCannotFallBackToTheOriginalPack() {
+        assertFalse(FettleExtension.mayFallbackToOriginal(false, List.of(PackProfile.SAFE)));
+        assertFalse(FettleExtension.mayFallbackToOriginal(
+                false, List.of(PackProfile.FULL, PackProfile.OPTIMIZE_MINI)));
+        assertFalse(FettleExtension.mayFallbackToOriginal(true, List.of(PackProfile.FULL)));
+        assertTrue(FettleExtension.mayFallbackToOriginal(false, List.of(PackProfile.FULL)));
+    }
+
+    @Test
+    void failedAutomaticSelectionTellsThePlayerBeforeGeyserDisconnects() {
+        AtomicReference<String> message = new AtomicReference<>();
+        GeyserConnection connection = connection(message);
+        ResourcePack target = pack(PACK_ID, "Scaffolding Base");
+        FakeEvent event = new FakeEvent(connection, List.of(target));
+
+        assertThrows(IllegalStateException.class, () -> new FettleExtension().onLoadResourcePacks(event));
+        assertEquals(
+                "§cFettle could not prepare or validate this server's required resource packs. Contact the server administrator.",
+                message.get());
+        assertEquals(List.of(target), event.resourcePacks());
+    }
 
     @Test
     void replacementKeepsTheOriginalSubpackSelection() throws Exception {
@@ -71,6 +96,60 @@ class FettlePackReplacementTest {
     }
 
     @Test
+    void failedFirstReplacementRestoresTheWholeLinkedGroup() throws Exception {
+        ResourcePack first = pack(PACK_ID);
+        UUID secondId = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        ResourcePack second = pack(secondId);
+        ResourcePack firstReplacement = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack secondReplacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, second));
+        event.failPack = firstReplacement;
+
+        assertFalse(new FettleExtension().replacePacks(
+                event,
+                List.of(first, second),
+                Map.of(first.uuid(), firstReplacement, second.uuid(), secondReplacement)));
+
+        assertEquals(List.of(first, second), event.resourcePacks());
+    }
+
+    @Test
+    void failedUnregisterRestoresTheOriginalStack() throws Exception {
+        ResourcePack first = pack(PACK_ID);
+        UUID secondId = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        ResourcePack second = pack(secondId);
+        ResourcePack firstReplacement = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack secondReplacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, second));
+        event.failUnregisterOnce = first.uuid();
+
+        assertFalse(new FettleExtension().replacePacks(
+                event,
+                List.of(first, second),
+                Map.of(first.uuid(), firstReplacement, second.uuid(), secondReplacement)));
+
+        assertEquals(List.of(first, second), event.resourcePacks());
+    }
+
+    @Test
+    void rollbackClearFailurePropagatesInsteadOfLeavingAnAcceptedPartialStack() {
+        ResourcePack first = pack(PACK_ID);
+        UUID secondId = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        ResourcePack second = pack(secondId);
+        ResourcePack firstReplacement = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack secondReplacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, second));
+        event.failPack = secondReplacement;
+        event.failUnregisterOnce = firstReplacement.uuid();
+
+        assertThrows(IllegalStateException.class, () -> new FettleExtension().replacePacks(
+                event,
+                List.of(first, second),
+                Map.of(first.uuid(), firstReplacement, second.uuid(), secondReplacement)));
+        assertEquals(List.of(firstReplacement), event.resourcePacks());
+    }
+
+    @Test
     void failedReplacementRestoresTheRequiredOriginalPackWithItsOptions() throws Exception {
         ResourcePack original = pack(PACK_ID);
         ResourcePack replacement = pack(PACK_ID);
@@ -83,6 +162,24 @@ class FettlePackReplacementTest {
         assertFalse(replaced);
         assertSame(original, event.packs.get(PACK_ID));
         assertEquals(List.of(subpack), event.options.get(PACK_ID));
+    }
+
+    @Test
+    void rollbackFailureIsPropagatedInsteadOfReturningWithAPartialRequiredStack() {
+        ResourcePack first = pack(PACK_ID);
+        UUID secondId = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
+        ResourcePack second = pack(secondId);
+        ResourcePack firstReplacement = pack(UUID.fromString("62ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        ResourcePack secondReplacement = pack(UUID.fromString("72ab4cb8-76d5-4f0f-8ca6-3788c23665e2"));
+        FakeEvent event = new FakeEvent(connection(), List.of(first, second));
+        event.failPack = secondReplacement;
+        event.failRestorePack = second;
+
+        assertThrows(IllegalStateException.class, () -> new FettleExtension().replacePacks(
+                event,
+                List.of(first, second),
+                Map.of(first.uuid(), firstReplacement, second.uuid(), secondReplacement)));
+        assertEquals(List.of(first), event.resourcePacks());
     }
 
     private static boolean replace(FettleExtension extension, FakeEvent event, ResourcePack original, ResourcePack replacement) {
@@ -132,7 +229,17 @@ class FettlePackReplacementTest {
     }
 
     private static GeyserConnection connection() {
-        InvocationHandler handler = (proxy, method, args) -> defaultValue(method.getReturnType());
+        return connection(new AtomicReference<>());
+    }
+
+    private static GeyserConnection connection(AtomicReference<String> message) {
+        InvocationHandler handler = (proxy, method, args) -> {
+            if (method.getName().equals("sendMessage")) {
+                message.set((String) args[0]);
+                return null;
+            }
+            return defaultValue(method.getReturnType());
+        };
         return (GeyserConnection) Proxy.newProxyInstance(
                 GeyserConnection.class.getClassLoader(),
                 new Class<?>[]{GeyserConnection.class},
@@ -155,6 +262,8 @@ class FettlePackReplacementTest {
         private final Map<UUID, ResourcePack> packs = new LinkedHashMap<>();
         private final Map<UUID, List<ResourcePackOption<?>>> options = new LinkedHashMap<>();
         private ResourcePack failPack;
+        private ResourcePack failRestorePack;
+        private UUID failUnregisterOnce;
 
         private FakeEvent(GeyserConnection connection, ResourcePack original, List<ResourcePackOption<?>> initialOptions) {
             super(connection);
@@ -180,7 +289,9 @@ class FettlePackReplacementTest {
         @Override
         public void register(ResourcePack pack, ResourcePackOption<?>... packOptions) {
             if (packs.containsKey(pack.uuid())) throw new IllegalArgumentException("duplicate pack UUID");
-            if (pack == failPack) throw new IllegalArgumentException("test registration failure");
+            if (pack == failPack || pack == failRestorePack) {
+                throw new IllegalArgumentException("test registration failure");
+            }
             packs.put(pack.uuid(), pack);
             options.put(pack.uuid(), new ArrayList<>(List.of(packOptions)));
         }
@@ -202,6 +313,10 @@ class FettlePackReplacementTest {
 
         @Override
         public boolean unregister(UUID uuid) {
+            if (uuid.equals(failUnregisterOnce)) {
+                failUnregisterOnce = null;
+                return false;
+            }
             options.remove(uuid);
             return packs.remove(uuid) != null;
         }

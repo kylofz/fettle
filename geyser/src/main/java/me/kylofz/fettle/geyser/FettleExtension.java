@@ -16,7 +16,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import me.kylofz.fettle.device.BedrockDeviceCapabilities;
 import me.kylofz.fettle.optimizer.PackAuditReport;
 import org.geysermc.event.PostOrder;
@@ -46,9 +49,12 @@ public final class FettleExtension implements Extension {
    private Path packCacheDirectory;
    private PackVariantManager variantManager;
    private volatile Map<ScaffoldingPackPolicy.AnimationVariant, PackSetAudit> preparedPackSetAudits = Map.of();
+   private volatile Map<ScaffoldingPackPolicy.AnimationVariant, String> packPreparationFailures = Map.of();
    private volatile PackProfile profile = PackProfile.AUTO;
    private volatile List<String> matchNameTokens = DEFAULT_MATCH_NAME_TOKENS;
    private volatile List<String> activeMatchNameTokens = this.matchNameTokens;
+   private volatile Set<UUID> matchPackUuids = Set.of();
+   private volatile Set<UUID> activeMatchPackUuids = this.matchPackUuids;
    private volatile Map<Integer, Long> textureBudgetOverrides = Map.of();
 
    @Subscribe
@@ -64,6 +70,7 @@ public final class FettleExtension implements Extension {
          this.loadConfig();
          this.loadProfiles();
          this.activeMatchNameTokens = this.matchNameTokens;
+         this.activeMatchPackUuids = this.matchPackUuids;
       } catch (Throwable throwable) {
          this.logger().severe("Fettle could not initialize.", throwable);
       }
@@ -85,6 +92,7 @@ public final class FettleExtension implements Extension {
    @Subscribe(postOrder = PostOrder.LAST)
    public void onDefineResourcePacks(GeyserDefineResourcePacksEvent event) {
       this.preparedPackSetAudits = Map.of();
+      this.packPreparationFailures = Map.of();
       if (this.variantManager == null) return;
       List<ResourcePack> packs = List.copyOf(event.resourcePacks());
       ResourcePack fullAnimation = ScaffoldingPackPolicy.find(packs, ScaffoldingPackPolicy.ANIMATED_PACK);
@@ -117,15 +125,21 @@ public final class FettleExtension implements Extension {
 
       Map<ScaffoldingPackPolicy.AnimationVariant, PackSetAudit> prepared =
          new EnumMap<>(ScaffoldingPackPolicy.AnimationVariant.class);
+      Map<ScaffoldingPackPolicy.AnimationVariant, String> preparationFailures =
+         new EnumMap<>(ScaffoldingPackPolicy.AnimationVariant.class);
       candidateStacks.forEach((animation, packStack) -> {
          try {
-            prepared.put(animation, this.preparePackSet(packStack, animation));
+            prepared.put(animation, this.preparePackSet(packStack, animation,
+               packOptions(packStack, event::options)));
          } catch (Throwable throwable) {
+            String failure = failureDescription(throwable);
+            preparationFailures.put(animation, failure);
             this.logger().warning("Could not prepare the " + animation.name() + " Scaffolding pack set: "
-               + failureDescription(throwable) + ". Original required packs remain available.");
+               + failure + ". Original required packs remain available.");
          }
       });
       this.preparedPackSetAudits = Map.copyOf(prepared);
+      this.packPreparationFailures = Map.copyOf(preparationFailures);
       try {
          PackVariantManager.CacheCleanup cleanup = this.variantManager.pruneGeneratedArtifacts();
          if (cleanup.deletedFiles() > 0) {
@@ -149,14 +163,15 @@ public final class FettleExtension implements Extension {
 
    private PackSetAudit preparePackSet(
       List<ResourcePack> packs,
-      ScaffoldingPackPolicy.AnimationVariant animation) throws Exception {
+      ScaffoldingPackPolicy.AnimationVariant animation,
+      Map<java.util.UUID, List<ResourcePackOption<?>>> packOptions) throws Exception {
       List<ResourcePack> targets = packs.stream().filter(this::matchesTargetPack).toList();
       if (!targets.isEmpty()) {
          targets.forEach(source -> this.logger().info("Preparing " + animation.name()
             + " Scaffolding variants for pack " + source.uuid() + " before Bedrock sessions connect."));
          long preparationStarted = System.nanoTime();
          Map<java.util.UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared =
-            this.variantManager.prepareSet(targets, packs, PackVariantManager.PREWARM_PROFILES);
+            this.variantManager.prepareSet(targets, packs, PackVariantManager.PREWARM_PROFILES, packOptions);
          if (!this.variantManager.variantIdentitiesSafe()) {
             this.logger().warning("Disabled optimized variants for the " + animation.name()
                + " Scaffolding pack set because a required-pack dependency uses a target pack UUID, or Fettle could not verify it. Original packs will be sent.");
@@ -185,25 +200,115 @@ public final class FettleExtension implements Extension {
          this.logger().info("Prepared " + targets.size() + " linked " + animation.name() + " Scaffolding packs in "
             + ((System.nanoTime() - preparationStarted) / 1_000_000L) + " ms.");
       }
-      return PackSetAudit.collect(packs, targets, this::matchesTargetPack, this.variantManager);
+      return PackSetAudit.collect(packs, targets, this::matchesTargetPack, this.variantManager, packOptions);
+   }
+
+   private ScaffoldingPackPolicy.Selection selectMeasuredAnimationVariant(
+      SessionLoadResourcePacksEvent event,
+      ResourcePack fullAnimation,
+      ResourcePack simpleAnimation,
+      BedrockDeviceCapabilities capabilities,
+      PackProfile override
+   ) {
+      List<ResourcePack> fullStack = ScaffoldingPackPolicy.stackWithout(event.resourcePacks(), simpleAnimation);
+      List<ResourcePack> simpleStack = ScaffoldingPackPolicy.stackWithout(event.resourcePacks(), fullAnimation);
+      DeviceSelectionPlanner.Plan fullPlan = this.planPreparedAnimationStack(
+         event, ScaffoldingPackPolicy.AnimationVariant.FULL, fullStack, capabilities, override);
+      DeviceSelectionPlanner.Plan simplePlan = this.planPreparedAnimationStack(
+         event, ScaffoldingPackPolicy.AnimationVariant.SIMPLE, simpleStack, capabilities, override);
+      boolean fullFits = fullPlan != null && fullPlan.selection().satisfiesPolicy();
+      boolean simpleFits = simplePlan != null && simplePlan.selection().satisfiesPolicy();
+      ScaffoldingPackPolicy.Selection selected = ScaffoldingPackPolicy.selectByPolicy(
+         event.resourcePacks(), fullFits, simpleFits);
+      if (selected.variant() == ScaffoldingPackPolicy.AnimationVariant.BOTH) {
+         DeviceProfilePolicy.Status fullStatus = animationStatus(ScaffoldingPackPolicy.AnimationVariant.FULL, fullPlan);
+         DeviceProfilePolicy.Status simpleStatus = animationStatus(ScaffoldingPackPolicy.AnimationVariant.SIMPLE, simplePlan);
+         throw new SelectionRejectedException(combinedAnimationFailureStatus(fullStatus, simpleStatus),
+            "Fettle AUTO found no validated Scaffolding animation set within policy: FULL="
+               + fullStatus + ", SIMPLE=" + simpleStatus + ".");
+      }
+      return selected;
+   }
+
+   static DeviceProfilePolicy.Status combinedAnimationFailureStatus(
+      DeviceProfilePolicy.Status fullStatus,
+      DeviceProfilePolicy.Status simpleStatus
+   ) {
+      if (fullStatus == DeviceProfilePolicy.Status.FAILED || simpleStatus == DeviceProfilePolicy.Status.FAILED) {
+         return DeviceProfilePolicy.Status.FAILED;
+      }
+      if (fullStatus == DeviceProfilePolicy.Status.SEARCH_LIMIT || simpleStatus == DeviceProfilePolicy.Status.SEARCH_LIMIT) {
+         return DeviceProfilePolicy.Status.SEARCH_LIMIT;
+      }
+      if (fullStatus == DeviceProfilePolicy.Status.OVER_BUDGET
+         && simpleStatus == DeviceProfilePolicy.Status.OVER_BUDGET) {
+         return DeviceProfilePolicy.Status.OVER_BUDGET;
+      }
+      if (fullStatus == DeviceProfilePolicy.Status.UNSUPPORTED || simpleStatus == DeviceProfilePolicy.Status.UNSUPPORTED) {
+         return DeviceProfilePolicy.Status.UNSUPPORTED;
+      }
+      return DeviceProfilePolicy.Status.UNMEASURED;
+   }
+
+   private DeviceProfilePolicy.Status animationStatus(
+      ScaffoldingPackPolicy.AnimationVariant variant,
+      DeviceSelectionPlanner.Plan plan
+   ) {
+      if (plan != null) return plan.selection().status();
+      return this.packPreparationFailures.containsKey(variant)
+         ? DeviceProfilePolicy.Status.FAILED : DeviceProfilePolicy.Status.UNMEASURED;
+   }
+
+   private DeviceSelectionPlanner.Plan planPreparedAnimationStack(
+      SessionLoadResourcePacksEvent event,
+      ScaffoldingPackPolicy.AnimationVariant variant,
+      List<ResourcePack> packStack,
+      BedrockDeviceCapabilities capabilities,
+      PackProfile override
+   ) {
+      PackSetAudit audit = this.preparedPackSetAudits.get(variant);
+      if (audit == null || !audit.preparedPackStackMatches()
+         || !audit.matches(packStack, packOptions(packStack, event::options))) return null;
+      return this.deviceProfiles.plan(capabilities, this.profile, override, this.textureBudgetOverrides, audit);
    }
 
    @Subscribe(postOrder = PostOrder.LAST)
    public void onLoadResourcePacks(SessionLoadResourcePacksEvent event) {
+      try {
+         this.loadResourcePacks(event);
+      } catch (RuntimeException | LinkageError failure) {
+         DeviceProfilePolicy.Status status = failure instanceof SelectionRejectedException rejected
+            ? rejected.status() : DeviceProfilePolicy.Status.FAILED;
+         this.deviceProfiles.recordRejectedSelection(status);
+         try {
+            event.connection().sendMessage(
+               "§cFettle could not prepare or validate this server's required resource packs. Contact the server administrator.");
+         } catch (RuntimeException | LinkageError messageFailure) {
+            failure.addSuppressed(messageFailure);
+         }
+         throw failure;
+      }
+   }
+
+   private void loadResourcePacks(SessionLoadResourcePacksEvent event) {
       GeyserConnection connection = event.connection();
       PackProfile override = this.playerProfiles.get(this.normalizeXuid(connection.xuid()));
       BedrockDeviceCapabilities capabilities = this.deviceProfiles.readCapabilities(connection);
       ResourcePack fullAnimation = ScaffoldingPackPolicy.find(event.resourcePacks(), ScaffoldingPackPolicy.ANIMATED_PACK);
       ResourcePack simpleAnimation = ScaffoldingPackPolicy.find(event.resourcePacks(), ScaffoldingPackPolicy.SIMPLE_PACK);
+      boolean automatic = override == PackProfile.AUTO || override == null && this.profile == PackProfile.AUTO;
       ScaffoldingPackPolicy.Selection animationChoice = fullAnimation != null && simpleAnimation != null
          && this.matchesTargetPack(fullAnimation) && this.matchesTargetPack(simpleAnimation)
-         ? ScaffoldingPackPolicy.selectForMemoryTier(event.resourcePacks(), capabilities.getMemoryTier())
+         ? automatic
+            ? this.selectMeasuredAnimationVariant(event, fullAnimation, simpleAnimation, capabilities, override)
+            : ScaffoldingPackPolicy.selectForMemoryTier(event.resourcePacks(), capabilities.getMemoryTier())
          : ScaffoldingPackPolicy.currentSelection(event.resourcePacks());
       PackSetAudit prewarmedPackSetAudit = this.preparedPackSetAudits.get(animationChoice.variant());
       if (animationChoice.omitted() != null) {
          List<ResourcePack> selectedStack = ScaffoldingPackPolicy.stackWithout(
             event.resourcePacks(), animationChoice.omitted());
-         if (prewarmedPackSetAudit == null || !prewarmedPackSetAudit.matches(selectedStack)) {
+         if (prewarmedPackSetAudit == null || !prewarmedPackSetAudit.matches(
+            selectedStack, packOptions(selectedStack, event::options))) {
             this.logger().warning("Kept both Scaffolding animation packs for " + connection.bedrockUsername()
                + ". The selected " + animationChoice.variant().name()
                + " pack set was not prepared or its IDs/content changed. Original packs will be sent.");
@@ -220,15 +325,26 @@ public final class FettleExtension implements Extension {
                + (capabilities.getMemoryTier() == null ? "unknown" : capabilities.getMemoryTier()) + ".");
          }
       }
+      List<ResourcePack> currentStack = List.copyOf(event.resourcePacks());
+      Map<java.util.UUID, List<ResourcePackOption<?>>> currentOptions = packOptions(currentStack, event::options);
+      if (automatic && currentStack.stream().anyMatch(this::matchesTargetPack)
+         && (prewarmedPackSetAudit == null || !prewarmedPackSetAudit.matches(currentStack, currentOptions))) {
+         DeviceProfilePolicy.Status status = this.packPreparationFailures.containsKey(animationChoice.variant())
+            ? DeviceProfilePolicy.Status.FAILED : DeviceProfilePolicy.Status.UNMEASURED;
+         throw new SelectionRejectedException(status,
+            "Fettle AUTO cannot use an unprepared or changed required pack stack. "
+               + "Result: " + status + ". The stack must be prepared and audited before a player session starts.");
+      }
       PackSetAudit packSetAudit = PackSetAudit.forSession(
-         prewarmedPackSetAudit, event.resourcePacks(), this::matchesTargetPack, this.variantManager);
+         prewarmedPackSetAudit, event.resourcePacks(), this::matchesTargetPack, this.variantManager,
+         currentOptions);
       if (packSetAudit.targetPacks().isEmpty()) {
          this.deviceProfiles.removeSession(connection);
          return;
       }
       DeviceSelectionPlanner.Plan plan = this.deviceProfiles.plan(
          capabilities, this.profile, override, this.textureBudgetOverrides, packSetAudit);
-      boolean automatic = plan.automatic();
+      automatic = plan.automatic();
       if (automatic && this.variantManager != null && !packSetAudit.preparedPackStackMatches()) {
          this.logger().warning("Skipped optimized profiles for " + connection.bedrockUsername()
             + ": this session's required packs differ from the prepared set. Original packs will be sent."
@@ -239,26 +355,55 @@ public final class FettleExtension implements Extension {
             + " hashes=" + packSetAudit.sourceHashes() + ".");
       }
       DeviceProfilePolicy.Selection selection = plan.selection();
+      if (automatic && !selection.satisfiesPolicy()) {
+         throw new SelectionRejectedException(selection.status(),
+            "Fettle cannot safely send the required resource-pack stack for "
+            + connection.bedrockUsername() + ": AUTO result " + selection.status()
+            + " (texture metrics " + (selection.metricsComplete() ? "complete" : "incomplete")
+            + ", atlas scan " + (selection.atlasMetricsComplete() ? "complete" : "incomplete")
+            + ", estimated texture-handle policy limit " + selection.maxTextureHandleCount()
+            + ", required pack files " + selection.requiredPackFileCount() + "/"
+            + selection.maxPackFileCount() + ").");
+      }
       Map<java.util.UUID, PackProfile> selectedProfiles = new java.util.LinkedHashMap<>();
       Map<java.util.UUID, ResourcePack> replacements = new java.util.LinkedHashMap<>();
       List<ResourcePack> originalStack = List.copyOf(event.resourcePacks());
       boolean variantsReady = true;
 
       for (ResourcePack original : plan.packSetAudit().targetPacks()) {
-         PackProfile selected = selection.profiles().getOrDefault(original.uuid(), PackProfile.FULL);
+         PackProfile selected = selection.profiles().get(original.uuid());
+         if (selected == null) {
+            PackProfile requested = override != null && override != PackProfile.AUTO ? override : this.profile;
+            if (!mayFallbackToOriginal(automatic, List.of(requested))) {
+               throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+                  "Fettle has no selected " + requested.name()
+                  + " variant for required pack " + original.uuid() + ".");
+            }
+            selected = PackProfile.FULL;
+         }
          ResourcePack replacement = original;
          try {
             if (selected != PackProfile.FULL) replacement = this.preparedVariant(plan.packSetAudit(), original, selected);
             if (replacement == null) {
-               this.logger().warning("Could not load the selected " + selected.name() + " variant for pack "
-                  + original.uuid() + ". Keeping the complete original target pack set.");
+               if (!mayFallbackToOriginal(automatic, List.of(selected))) {
+                  throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+                     "Fettle cannot load the requested " + selected.name()
+                     + " variant for required pack " + original.uuid() + ".");
+               }
+               this.logger().warning("Could not load the requested " + selected.name() + " variant for pack "
+                  + original.uuid() + ". Keeping the explicitly requested original pack.");
                variantsReady = false;
                selected = PackProfile.FULL;
                replacement = original;
             }
          } catch (RuntimeException | LinkageError failure) {
+            if (!mayFallbackToOriginal(automatic, List.of(selected))) {
+               throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+                  "Fettle could not load the requested "
+                  + selected.name() + " variant for required pack " + original.uuid() + ".", failure);
+            }
             this.logger().warning("Selection failed for pack " + original.uuid() + " ("
-               + failure.getClass().getSimpleName() + "). Keeping the complete original target pack set.");
+               + failure.getClass().getSimpleName() + "). Keeping the explicitly requested original pack.");
             variantsReady = false;
             selected = PackProfile.FULL;
             replacement = original;
@@ -273,16 +418,25 @@ public final class FettleExtension implements Extension {
             selectedProfiles.put(original.uuid(), PackProfile.FULL);
          }
       } else {
+         boolean replaced;
          try {
-            if (!this.replacePacks(event, originalStack, replacements)) {
-               this.logger().warning("Could not register the selected pack set for " + connection.bedrockUsername()
-                  + ". Restored the original required pack stack.");
-               selectedProfiles.replaceAll((uuid, ignored) -> PackProfile.FULL);
-            }
+            replaced = this.replacePacks(event, originalStack, replacements);
          } catch (RuntimeException | LinkageError rollbackFailure) {
             this.logger().severe("Fettle could not restore the original pack stack for "
                + connection.bedrockUsername() + " after a registration failure.", rollbackFailure);
-            return;
+            throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+               "Fettle could not restore the required resource-pack stack for "
+               + connection.bedrockUsername() + ".", rollbackFailure);
+         }
+         if (!replaced) {
+            if (!mayFallbackToOriginal(automatic, selectedProfiles.values())) {
+               throw new SelectionRejectedException(DeviceProfilePolicy.Status.FAILED,
+                  "Fettle could not install the selected "
+               + "required pack stack for " + connection.bedrockUsername() + ".");
+            }
+            this.logger().warning("Could not register the selected pack set for " + connection.bedrockUsername()
+               + ". Restored the explicitly requested original required pack stack.");
+            selectedProfiles.replaceAll((uuid, ignored) -> PackProfile.FULL);
          }
       }
 
@@ -293,13 +447,6 @@ public final class FettleExtension implements Extension {
       } catch (RuntimeException | LinkageError ignored) {
       }
       SessionDeviceSnapshot snapshot = plan.snapshot(selectedProfiles, scaffoldingAnimation, geyserProtocolVersion);
-      if (automatic && snapshot.textureHandleMetricsComplete() && snapshot.estimatedTextureHandleUpperBound()
-         > PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE) {
-         this.logger().warning("Fettle estimates up to " + snapshot.estimatedTextureHandleUpperBound()
-            + " texture handles across the required packs for " + connection.bedrockUsername()
-            + ". Resizing does not reduce handle count. Creator Tools' add-on guidance is "
-            + PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE + ".");
-      }
       if (automatic && !snapshot.atlasMetricsComplete()) {
          this.logger().warning("Could not scan all atlas references for " + connection.bedrockUsername()
             + ". AUTO cannot confirm Fettle's conservative 256 MiB limit for the full pack set.");
@@ -325,7 +472,7 @@ public final class FettleExtension implements Extension {
       } else if (automatic && !snapshot.withinBudget()) {
          this.logger().warning(
             "Selected packs for " + connection.bedrockUsername() + " use an estimated "
-               + this.humanBytes(snapshot.estimatedResourceMemoryBytes()) + " for decoded textures and rounded atlases, against a "
+               + this.humanBytes(snapshot.estimatedTextureBytes()) + " of decoded textures, against a "
                + this.humanBytes(snapshot.textureBudgetBytes())
                + (plan.defaultTierBudget() ? " automatic MemoryTier budget" : " configured MemoryTier budget")
                + (snapshot.metricsComplete() ? "." : ". Measurement is incomplete.")
@@ -383,6 +530,7 @@ public final class FettleExtension implements Extension {
                   + summary.selectionOutcomes());
                source.sendMessage("§7Waiting for Geyser initialization: §f" + summary.pendingInitialization());
                source.sendMessage("§7Pack-selection attempts since startup: §f" + summary.packJoinAttemptCounts());
+               source.sendMessage("§7Rejected pack selections by result: §f" + summary.rejectedSelectionCounts());
                source.sendMessage("§7Joins after Geyser initialization (not proof of rendering): §f"
                   + summary.postInitializationJoinCounts());
                source.sendMessage("§7Average time from selection to initialization (ms): §f"
@@ -428,17 +576,25 @@ public final class FettleExtension implements Extension {
                   ? "not present"
                   : snapshot.scaffoldingAnimationVariant();
                String handleGuidance = !snapshot.textureHandleMetricsComplete() ? "unknown"
-                  : snapshot.estimatedTextureHandleUpperBound() <= PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE
-                     ? "within " + PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE
-                     : "above " + PackAuditReport.CREATOR_TOOLS_ADDON_TEXTURE_HANDLE_GUIDANCE;
+                  : snapshot.withinTextureHandleLimit()
+                     ? "within Fettle's 4,000-handle estimate policy"
+                     : "above Fettle's 4,000-handle estimate policy";
                String budgetSource = snapshot.defaultTierBudget() ? "automatic MemoryTier budget"
                   : snapshot.budgetKnown() ? "configured MemoryTier budget"
-                     : snapshot.textureBudgetBytes() > 0 ? "conservative cap for an unknown tier" : "no usable MemoryTier";
+                     : snapshot.textureBudgetBytes() > 0 ? "unknown-tier conservative cap" : "no usable MemoryTier";
                String budgetFit = snapshot.budgetKnown() && snapshot.metricsComplete()
                   ? Boolean.toString(snapshot.withinBudget()) : "unknown";
                long packFileCount = snapshot.packAudits().stream()
                   .filter(pack -> pack.report() != null)
                   .mapToLong(pack -> pack.report().getFileCount())
+                  .sum();
+               long uncompressedPackBytes = snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null)
+                  .mapToLong(pack -> pack.report().getUncompressedBytes())
+                  .sum();
+               long animationMetadataCount = snapshot.packAudits().stream()
+                  .filter(pack -> pack.report() != null)
+                  .mapToLong(pack -> pack.report().getPngAnimationMetadataCount())
                   .sum();
                boolean packFileCountComplete = snapshot.packAudits().stream().allMatch(pack -> pack.report() != null);
                source.sendMessage("§aBedrock client report for §f" + xuid);
@@ -456,17 +612,23 @@ public final class FettleExtension implements Extension {
                   + "§7, client-side chunk generation: §f" + capabilities.getCompatibleWithClientSideChunkGen());
                source.sendMessage("§7Selection MemoryTier: §f" + snapshot.selectionMemoryTier()
                   + "§7, Scaffolding animation: §f" + animationVariant
+                  + "§7, selection result: §f" + snapshot.selectionStatus()
                   + "§7, selected profiles: §f" + snapshot.selectedProfiles());
                source.sendMessage("§7Pack archive sizes: §f" + snapshot.packAudits().stream()
                   .filter(pack -> pack.report() != null)
                   .map(pack -> pack.name().replace("§", "") + " (" + pack.profile() + "): "
                      + this.humanBytes(pack.report().getArchiveBytes()))
                   .toList());
+               source.sendMessage("§7Uncompressed archive data: §f~" + this.humanBytes(uncompressedPackBytes)
+                  + (packFileCountComplete ? "" : " (partial)")
+                  + "§7, PNG animation metadata: §f~" + animationMetadataCount
+                  + "§7 (archive totals may include overridden files; runtime cost is unmeasured).");
                source.sendMessage("§7Pack files: §f~" + packFileCount + (packFileCountComplete ? "" : " (partial)")
+                  + "§7, AUTO limit: §f" + DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT
                   + "§7, texture files: §f~" + snapshot.estimatedTextureFileCount()
                   + (snapshot.metricsComplete() ? "" : " (partial)"));
                source.sendMessage("§7Decoded texture estimate: §f" + this.humanBytes(snapshot.estimatedTextureBytes())
-                  + "§7, texture plus rounded atlases: §f" + this.humanBytes(snapshot.estimatedResourceMemoryBytes()));
+                  + "§7, atlas allocations are measured and checked separately.");
                source.sendMessage("§7Rounded atlas estimates for all required packs: item §f"
                   + this.humanBytes(PackAuditReport.roundedAtlasAllocationBytes(snapshot.estimatedItemAtlasTextureBytes()))
                   + "§7, block §f"
@@ -720,6 +882,7 @@ public final class FettleExtension implements Extension {
             .playerOnly(false)
             .executor((source, command, args) -> {
                List<String> activeMatches = this.activeMatchNameTokens;
+               Set<UUID> activePackUuids = this.activeMatchPackUuids;
                boolean configLoaded = this.loadConfig();
                boolean profilesLoaded = this.loadProfiles();
                if (!configLoaded || !profilesLoaded) {
@@ -731,8 +894,9 @@ public final class FettleExtension implements Extension {
                   return;
                }
                source.sendMessage(activeMatches.equals(this.matchNameTokens)
+                  && activePackUuids.equals(this.matchPackUuids)
                   ? "§aFettle profiles and budgets reloaded."
-                  : "§aFettle profiles and budgets reloaded. Restart Geyser to apply match-name changes and prepare variants.");
+                  : "§aFettle profiles and budgets reloaded. Restart Geyser to apply pack-matching changes and prepare variants.");
             })
             .build()
       );
@@ -847,9 +1011,24 @@ public final class FettleExtension implements Extension {
       }
    }
 
+   private static Map<java.util.UUID, List<ResourcePackOption<?>>> packOptions(
+      Collection<ResourcePack> packs,
+      Function<java.util.UUID, Collection<ResourcePackOption<?>>> optionSource) {
+      Map<java.util.UUID, List<ResourcePackOption<?>>> result = new java.util.LinkedHashMap<>();
+      for (ResourcePack pack : packs) {
+         Collection<ResourcePackOption<?>> options = optionSource.apply(pack.uuid());
+         result.put(pack.uuid(), options == null ? List.of() : List.copyOf(options));
+      }
+      return Map.copyOf(result);
+   }
+
    private static boolean samePackOrder(Collection<ResourcePack> actual, List<ResourcePack> expected) {
       return actual.stream().map(ResourcePack::uuid).toList()
          .equals(expected.stream().map(ResourcePack::uuid).toList());
+   }
+
+   static boolean mayFallbackToOriginal(boolean automatic, Collection<PackProfile> selectedProfiles) {
+      return !automatic && selectedProfiles.stream().allMatch(selected -> selected == PackProfile.FULL);
    }
 
    static String failureDescription(Throwable failure) {
@@ -861,6 +1040,7 @@ public final class FettleExtension implements Extension {
    }
 
    private boolean matchesTargetPack(ResourcePack pack) {
+      if (this.activeMatchPackUuids.contains(pack.uuid())) return true;
       String text = this.describe(pack).toLowerCase(Locale.ROOT);
       return this.activeMatchNameTokens.stream().anyMatch(token -> !token.isBlank() && text.contains(token));
    }
@@ -919,7 +1099,24 @@ public final class FettleExtension implements Extension {
          List<String> loadedMatchNameTokens = parseMatchNameTokens(properties.getProperty(
             "match-name-contains", "scaffolding,nexo,mythicmobs,modelengine,geysermodelengine"
          ));
+         Set<UUID> loadedMatchPackUuids;
+         try {
+            loadedMatchPackUuids = parseMatchPackUuids(properties.getProperty("match-pack-uuids", ""));
+         } catch (IllegalArgumentException invalidPackUuids) {
+            this.logger().warning("Ignored match-pack-uuids because it contains an invalid UUID: "
+               + failureDescription(invalidPackUuids));
+            loadedMatchPackUuids = Set.of();
+         }
          Map<Integer, Long> budgets = new HashMap<>();
+         String unknownBudget = properties.getProperty("texture-budget-unknown-mib");
+         if (unknownBudget != null) {
+            Long bytes = DeviceProfilePolicy.parseTextureBudgetMib(unknownBudget);
+            if (bytes == null) {
+               this.logger().warning("Ignored invalid texture-budget-unknown-mib value. Enter a number from 0 to 8192 MiB.");
+            } else {
+               budgets.put(DeviceProfilePolicy.UNKNOWN_TIER_CONFIG_KEY, bytes);
+            }
+         }
          for (int tier = 0; tier <= 4; tier++) {
             String key = "texture-budget-memory-tier-" + tier + "-mib";
             String value = properties.getProperty(key);
@@ -933,6 +1130,7 @@ public final class FettleExtension implements Extension {
          }
          this.profile = loadedProfile;
          this.matchNameTokens = loadedMatchNameTokens;
+         this.matchPackUuids = loadedMatchPackUuids;
          this.textureBudgetOverrides = Map.copyOf(budgets);
          return true;
       } catch (Throwable throwable) {
@@ -959,6 +1157,14 @@ public final class FettleExtension implements Extension {
          }
          properties.setProperty("profile", profileConfigValue(this.profile));
          properties.setProperty("match-name-contains", String.join(",", this.matchNameTokens));
+         properties.setProperty("match-pack-uuids", this.matchPackUuids.stream()
+            .map(UUID::toString).sorted().collect(java.util.stream.Collectors.joining(",")));
+         Long unknownBudget = this.textureBudgetOverrides.get(DeviceProfilePolicy.UNKNOWN_TIER_CONFIG_KEY);
+         if (unknownBudget != null) {
+            properties.setProperty("texture-budget-unknown-mib", Long.toString(unknownBudget / (1024L * 1024L)));
+         } else {
+            properties.remove("texture-budget-unknown-mib");
+         }
          for (int tier = 0; tier <= 4; tier++) {
             String key = "texture-budget-memory-tier-" + tier + "-mib";
             Long bytes = this.textureBudgetOverrides.get(tier);
@@ -1050,6 +1256,21 @@ public final class FettleExtension implements Extension {
       return List.copyOf(result);
    }
 
+   static Set<UUID> parseMatchPackUuids(String value) {
+      Set<UUID> result = new java.util.LinkedHashSet<>();
+      if (value == null || value.isBlank()) return Set.of();
+      for (String token : value.split(",")) {
+         String normalized = token.trim();
+         if (normalized.isEmpty()) continue;
+         UUID uuid = UUID.fromString(normalized);
+         if (!uuid.toString().equalsIgnoreCase(normalized)) {
+            throw new IllegalArgumentException("Expected a canonical UUID, got " + normalized);
+         }
+         result.add(uuid);
+      }
+      return Set.copyOf(result);
+   }
+
    private String humanBytes(long bytes) {
       if (bytes < 1024L) {
          return bytes + " B";
@@ -1057,6 +1278,24 @@ public final class FettleExtension implements Extension {
 
       double kb = bytes / 1024.0;
       return kb < 1024.0 ? String.format(Locale.ROOT, "%.1f KB", kb) : String.format(Locale.ROOT, "%.1f MB", kb / 1024.0);
+   }
+
+   private static final class SelectionRejectedException extends IllegalStateException {
+      private final DeviceProfilePolicy.Status status;
+
+      private SelectionRejectedException(DeviceProfilePolicy.Status status, String message) {
+         super(message);
+         this.status = status;
+      }
+
+      private SelectionRejectedException(DeviceProfilePolicy.Status status, String message, Throwable cause) {
+         super(message, cause);
+         this.status = status;
+      }
+
+      private DeviceProfilePolicy.Status status() {
+         return status;
+      }
    }
 
 }

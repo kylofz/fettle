@@ -46,7 +46,8 @@ final class DeviceSelectionPlanner {
                 packSetAudit.variantReports(), packSetAudit.fixedTextureMemoryBytes(),
                 packSetAudit.fixedTextureFileCount(), packSetAudit.fixedItemAtlasTextureMemoryBytes(),
                 packSetAudit.fixedBlockAtlasTextureMemoryBytes(), packSetAudit.fixedAtlasMetricsComplete(),
-                packSetAudit.fixedMetricsComplete(),
+                packSetAudit.fixedMetricsComplete(), packSetAudit.fixedPackFileCount(),
+                packSetAudit.fixedTextureHandleUpperBound(), packSetAudit.fixedHandleMetricsComplete(),
                 packSetAudit.linkedProfileGroups());
         DeviceProfilePolicy.Selection selection;
         synchronized (selections) {
@@ -64,7 +65,13 @@ final class DeviceSelectionPlanner {
                         packSetAudit.linkedProfileGroups(),
                         packSetAudit.fixedItemAtlasTextureMemoryBytes(),
                         packSetAudit.fixedBlockAtlasTextureMemoryBytes(),
-                        packSetAudit.fixedAtlasMetricsComplete());
+                        packSetAudit.fixedAtlasMetricsComplete(), packSetAudit.fixedPackFileCount(),
+                        DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, packSetAudit.fixedTextureHandleUpperBound(),
+                        packSetAudit.fixedHandleMetricsComplete(), DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT);
+                if (automatic && packSetAudit.fixedPackReports().values().stream()
+                        .anyMatch(PackAuditReport::getOptimizationUnsupported)) {
+                    selection = selection.withStatus(DeviceProfilePolicy.Status.UNSUPPORTED);
+                }
                 selections.put(key, selection);
             }
         }
@@ -84,6 +91,9 @@ final class DeviceSelectionPlanner {
             long fixedBlockAtlasTextureMemoryBytes,
             boolean fixedAtlasMetricsComplete,
             boolean fixedMetricsComplete,
+            long fixedPackFileCount,
+            long fixedTextureHandleUpperBound,
+            boolean fixedHandleMetricsComplete,
             List<Set<UUID>> linkedProfileGroups) {
     }
 
@@ -113,28 +123,26 @@ final class DeviceSelectionPlanner {
                     selection.budgetKnown(),
                     packSetAudit.fixedItemAtlasTextureMemoryBytes(),
                     packSetAudit.fixedBlockAtlasTextureMemoryBytes(),
-                    packSetAudit.fixedAtlasMetricsComplete());
-            DeviceProfilePolicy.TextureHandleEstimate handles = DeviceProfilePolicy.estimateTextureHandles(
-                    selectedProfiles,
-                    packSetAudit.variantReports(),
-                    packSetAudit.fixedTextureHandleUpperBound(),
-                    packSetAudit.fixedHandleMetricsComplete());
+                    packSetAudit.fixedAtlasMetricsComplete(), packSetAudit.fixedPackFileCount(),
+                    DeviceProfilePolicy.AUTO_PACK_FILE_LIMIT, packSetAudit.fixedTextureHandleUpperBound(),
+                    packSetAudit.fixedHandleMetricsComplete(), DeviceProfilePolicy.AUTO_TEXTURE_HANDLE_LIMIT);
             return new SessionDeviceSnapshot(
                     capabilities,
                     geyserProtocolVersion,
                     selectionMemoryTier,
                     scaffoldingAnimation,
+                    delivered.status(),
                     selectedProfiles,
                     packSetAudit.selectedPackAudits(selectedProfiles),
                     delivered.textureBudgetBytes(),
                     delivered.estimatedTextureBytes(),
                     delivered.estimatedTextureFileCount(),
-                    delivered.estimatedResourceMemoryBytes(),
                     delivered.estimatedItemAtlasTextureBytes(),
                     delivered.estimatedBlockAtlasTextureBytes(),
-                    handles.upperBound(),
+                    delivered.estimatedTextureHandleUpperBound(),
                     delivered.metricsComplete(),
-                    handles.complete(),
+                    delivered.textureHandleMetricsComplete(),
+                    delivered.withinTextureHandleLimit(),
                     delivered.budgetKnown(),
                     delivered.withinBudget(),
                     delivered.atlasMetricsComplete(),

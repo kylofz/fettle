@@ -5,7 +5,10 @@ import me.kylofz.fettle.optimizer.PackAuditor;
 import me.kylofz.fettle.optimizer.PackOptimizationReport;
 import me.kylofz.fettle.optimizer.PackOptimizer;
 import org.geysermc.geyser.api.pack.PackCodec;
+import org.geysermc.geyser.api.pack.PathPackCodec;
 import org.geysermc.geyser.api.pack.ResourcePack;
+import org.geysermc.geyser.api.pack.UrlPackCodec;
+import org.geysermc.geyser.api.pack.option.ResourcePackOption;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -40,7 +43,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 final class PackVariantManager {
-    static final String REWRITE_REVISION = "device-tier-v41";
+    static final String REWRITE_REVISION = "device-tier-v42";
     static final List<PackProfile> PREWARM_PROFILES = List.of(
             PackProfile.FULL, PackProfile.OPTIMIZE_FULL, PackProfile.OPTIMIZE_SEMI,
             PackProfile.OPTIMIZE_MINI, PackProfile.SAFE);
@@ -59,6 +62,8 @@ final class PackVariantManager {
     private final Map<Path, VerifiedArtifact> verifiedArtifacts = new HashMap<>();
     private String activeSetFingerprint = "";
     private String activePackStackFingerprint = "";
+    private List<ResourcePack> activeOriginals = List.of();
+    private Map<UUID, String> activePackOptionFingerprints = Map.of();
     private List<Set<Integer>> activeLinkedPackGroupIndexes = List.of();
     private Set<String> activeProtectedTexturePaths = Set.of();
     private boolean activeCrossPackTextureDedupAllowed = true;
@@ -78,6 +83,15 @@ final class PackVariantManager {
     synchronized PreparedVariant prepare(ResourcePack original, PackProfile profile) throws Exception {
         if (profile == PackProfile.AUTO) {
             throw new IllegalArgumentException("AUTO is a selection strategy, not a generated pack");
+        }
+
+        String unsupportedReason = unsupportedCodecReason(original);
+        if (unsupportedReason != null && (profile != PackProfile.FULL || !(original.codec() instanceof PathPackCodec))) {
+            return unsupportedVariant(original, profile, unsupportedReason);
+        }
+        if (profile != PackProfile.FULL && hasContentKey(original)) {
+            return unsupportedVariant(original, profile,
+                    "The pack has a content key, so Fettle cannot safely change its content identity.");
         }
 
         String fingerprint = fingerprint(original, profile);
@@ -143,10 +157,18 @@ final class PackVariantManager {
             Collection<ResourcePack> originals,
             Collection<ResourcePack> packStack,
             Collection<PackProfile> profiles) throws Exception {
-        List<ResourcePack> packs = originals.stream()
-                .sorted(java.util.Comparator.comparing(pack -> pack.uuid().toString())).toList();
-        List<ResourcePack> stack = packStack.stream()
-                .sorted(java.util.Comparator.comparing(pack -> pack.uuid().toString())).toList();
+        return prepareSet(originals, packStack, profiles, Map.of());
+    }
+
+    synchronized Map<UUID, Map<PackProfile, PreparedVariant>> prepareSet(
+            Collection<ResourcePack> originals,
+            Collection<ResourcePack> packStack,
+            Collection<PackProfile> profiles,
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> packOptions) throws Exception {
+        List<ResourcePack> packs = List.copyOf(originals);
+        List<ResourcePack> stack = List.copyOf(packStack);
+        this.activeOriginals = packs;
+        this.activePackOptionFingerprints = optionFingerprints(packOptions);
         Map<UUID, String> stackHashes = new HashMap<>();
         for (ResourcePack pack : stack) {
             if (stackHashes.put(pack.uuid(), sourceHash(pack)) != null) {
@@ -158,10 +180,19 @@ final class PackVariantManager {
                 throw new IllegalArgumentException("Every optimized pack must be present unchanged in the full stack");
             }
         }
-        this.activeSetFingerprint = packSetFingerprint(packs, stackHashes);
-        this.activePackStackFingerprint = packSetFingerprint(stack, stackHashes);
+        this.activeSetFingerprint = packSetFingerprint(packs, stackHashes, this.activePackOptionFingerprints);
+        this.activePackStackFingerprint = packSetFingerprint(stack, stackHashes, this.activePackOptionFingerprints);
         Set<UUID> targetIds = packs.stream().map(ResourcePack::uuid).collect(java.util.stream.Collectors.toSet());
         this.activeVariantIdentitiesSafe = canAssignDistinctVariantIds(stack, targetIds);
+        if (stack.stream().anyMatch(pack -> unsupportedCodecReason(pack) != null || hasContentKey(pack))) {
+            this.activeLinkedPackGroupIndexes = List.of();
+            this.linkedProfileGroups = List.of();
+            Map<UUID, Map<PackProfile, PreparedVariant>> originalsOnly = new LinkedHashMap<>();
+            for (ResourcePack pack : packs) {
+                originalsOnly.put(pack.uuid(), Map.of(PackProfile.FULL, prepare(pack, PackProfile.FULL)));
+            }
+            return Map.copyOf(originalsOnly);
+        }
         List<Path> groupSources = new ArrayList<>(packs.size());
         List<Path> fixedPackSources = new ArrayList<>();
         try {
@@ -225,7 +256,9 @@ final class PackVariantManager {
     private Map<UUID, PreparedVariant> prepareSetVariant(
             List<ResourcePack> originals,
             PackProfile profile) throws Exception {
+        if (originals.isEmpty()) return Map.of();
         boolean lossless = isLossless(profile);
+        Path completionRecord = setCompletionFile(originals, profile);
         Map<UUID, PreparedVariant> cached = new LinkedHashMap<>();
         boolean allCached = true;
         for (ResourcePack original : originals) {
@@ -235,7 +268,13 @@ final class PackVariantManager {
             if (variant == null) allCached = false;
             else cached.put(original.uuid(), variant);
         }
-        if (allCached) return Map.copyOf(cached);
+        if (allCached) {
+            if (!isValidSetCompletion(completionRecord, originals, profile)) {
+                writeSetCompletion(completionRecord, originals, profile);
+            }
+            return Map.copyOf(cached);
+        }
+        Files.deleteIfExists(completionRecord);
 
         Map<UUID, PreparedVariant> losslessSources = new LinkedHashMap<>();
         boolean allLosslessSourcesCached = profile != PackProfile.OPTIMIZE_FULL;
@@ -335,7 +374,12 @@ final class PackVariantManager {
                         cacheKey(original, fingerprint),
                         new PreparedVariant(fingerprint, profile, pack, output, outputAudits.get(index))));
             }
-            return Map.copyOf(prepared);
+            Map<UUID, PreparedVariant> result = Map.copyOf(prepared);
+            if (!completeSetMembers(originals, profile, result)) {
+                throw new IOException("Generated linked pack set failed its publication checks");
+            }
+            writeSetCompletion(completionRecord, originals, profile);
+            return result;
         } catch (Exception | LinkageError failure) {
             for (Path temporary : temporaryOutputs) Files.deleteIfExists(temporary);
             throw failure;
@@ -348,6 +392,14 @@ final class PackVariantManager {
     synchronized PreparedVariant prepareIfCached(ResourcePack original, PackProfile profile) throws Exception {
         if (profile == PackProfile.AUTO) {
             throw new IllegalArgumentException("AUTO is a selection strategy, not a generated pack");
+        }
+        String unsupportedReason = unsupportedCodecReason(original);
+        if (unsupportedReason != null && (profile != PackProfile.FULL || !(original.codec() instanceof PathPackCodec))) {
+            return unsupportedVariant(original, profile, unsupportedReason);
+        }
+        if (profile != PackProfile.FULL && hasContentKey(original)) {
+            return unsupportedVariant(original, profile,
+                    "The pack has a content key, so Fettle cannot safely change its content identity.");
         }
         String fingerprint = fingerprint(original, profile);
         return loadCached(original, profile, fingerprint, cacheKey(original, fingerprint));
@@ -377,16 +429,26 @@ final class PackVariantManager {
             Collection<ResourcePack> packStack,
             Collection<ResourcePack> originals,
             Map<UUID, String> sourceHashes) {
+        return matchesPreparedSet(packStack, originals, sourceHashes, Map.of());
+    }
+
+    synchronized boolean matchesPreparedSet(
+            Collection<ResourcePack> packStack,
+            Collection<ResourcePack> originals,
+            Map<UUID, String> sourceHashes,
+            Map<UUID, String> optionFingerprints) {
         if (activeSetFingerprint.isEmpty() || activePackStackFingerprint.isEmpty()) return false;
         try {
-            return activeSetFingerprint.equals(packSetFingerprint(List.copyOf(originals), sourceHashes))
-                    && activePackStackFingerprint.equals(packSetFingerprint(List.copyOf(packStack), sourceHashes));
+            return activeSetFingerprint.equals(packSetFingerprint(List.copyOf(originals), sourceHashes, optionFingerprints))
+                    && activePackStackFingerprint.equals(packSetFingerprint(List.copyOf(packStack), sourceHashes, optionFingerprints));
         } catch (Exception | LinkageError invalidPackSet) {
             return false;
         }
     }
 
     PreparedVariant preparedVariantIfCached(ResourcePack original, PackProfile profile) {
+        if (profile != PackProfile.FULL && activeOriginals.stream().anyMatch(pack -> pack.uuid().equals(original.uuid()))
+                && !activeSetCompletionValid(profile)) return null;
         try {
             return prepareIfCached(original, profile);
         } catch (Exception | LinkageError invalidCache) {
@@ -444,6 +506,11 @@ final class PackVariantManager {
                 .filter(java.util.Objects::nonNull)
                 .map(PackVariantManager::normalizedPath)
                 .collect(java.util.stream.Collectors.toSet());
+        if (!activeOriginals.isEmpty()) {
+            PREWARM_PROFILES.stream().filter(profile -> profile != PackProfile.FULL)
+                    .map(profile -> setCompletionFile(activeOriginals, profile))
+                    .map(PackVariantManager::normalizedPath).forEach(activeFiles::add);
+        }
         Map<String, List<Path>> pathsByVariant = new HashMap<>();
         List<CachedFile> staleTemporaryFiles = new ArrayList<>();
         long staleBefore = System.currentTimeMillis() - STALE_TEMP_AGE_MILLIS;
@@ -474,7 +541,8 @@ final class PackVariantManager {
             List<CachedFile> files = new ArrayList<>(entry.getValue().size());
             long groupBytes = 0;
             long newestModification = Long.MIN_VALUE;
-            boolean active = activeFiles.contains(normalizedPath(cacheDirectory.resolve(entry.getKey())));
+            boolean active = activeFiles.contains(normalizedPath(cacheDirectory.resolve(entry.getKey())))
+                    || entry.getValue().stream().map(PackVariantManager::normalizedPath).anyMatch(activeFiles::contains);
             for (Path file : entry.getValue()) {
                 try {
                     long size = Files.size(file);
@@ -534,6 +602,7 @@ final class PackVariantManager {
         String candidate = name;
         if (candidate.endsWith(".integrity")) candidate = candidate.substring(0, candidate.length() - ".integrity".length());
         else if (candidate.endsWith(".no-change")) candidate = candidate.substring(0, candidate.length() - ".no-change".length());
+        else if (candidate.endsWith(".set-complete")) candidate = candidate.substring(0, candidate.length() - ".set-complete".length());
         return GENERATED_VARIANT.matcher(candidate).matches() ? candidate : null;
     }
 
@@ -547,7 +616,8 @@ final class PackVariantManager {
         String suffix = candidate.substring(marker + ".mcpack".length());
         return GENERATED_VARIANT.matcher(base).matches()
                 && (suffix.matches("[A-Za-z0-9._-]+\\.tmp")
-                || suffix.matches("\\.no-change[A-Za-z0-9_-]+\\.tmp"));
+                || suffix.matches("\\.no-change[A-Za-z0-9_-]+\\.tmp")
+                || suffix.matches("\\.set-complete[A-Za-z0-9_-]+\\.tmp"));
     }
 
     private static Path normalizedPath(Path path) {
@@ -575,6 +645,8 @@ final class PackVariantManager {
         verifiedArtifacts.clear();
         activeSetFingerprint = "";
         activePackStackFingerprint = "";
+        activeOriginals = List.of();
+        activePackOptionFingerprints = Map.of();
         activeLinkedPackGroupIndexes = List.of();
         activeProtectedTexturePaths = Set.of();
         activeCrossPackTextureDedupAllowed = true;
@@ -624,6 +696,87 @@ final class PackVariantManager {
     private Path outputFile(ResourcePack original, String fingerprint, PackProfile profile) {
         return cacheDirectory.resolve(
                 original.uuid() + "-" + shortHash(fingerprint) + "-" + profile.name().toLowerCase(Locale.ROOT) + ".mcpack");
+    }
+
+    private PreparedVariant unsupportedVariant(ResourcePack original, PackProfile profile, String reason) {
+        String fingerprint = sourceHash(original) + "-" + REWRITE_REVISION + "-unsupported-" + profile.name();
+        return remember(cacheKey(original, fingerprint), new PreparedVariant(
+                fingerprint, profile, original, null, PackAuditReport.unsupported(reason)));
+    }
+
+    private static String unsupportedCodecReason(ResourcePack pack) {
+        if (pack.codec() instanceof UrlPackCodec) {
+            return "URL-delivered packs cannot be rewritten without changing Geyser CDN delivery behavior.";
+        }
+        if (!(pack.codec() instanceof PathPackCodec)) {
+            return "Fettle can only analyze Geyser path-backed resource packs.";
+        }
+        return null;
+    }
+
+    private static boolean hasContentKey(ResourcePack pack) {
+        String contentKey = pack.contentKey();
+        return contentKey != null && !contentKey.isBlank();
+    }
+
+    private Path setCompletionFile(List<ResourcePack> originals, PackProfile profile) {
+        ResourcePack anchor = originals.get(0);
+        Path output = outputFile(anchor, fingerprint(anchor, profile), profile);
+        return output.resolveSibling(output.getFileName() + ".set-complete");
+    }
+
+    private String setCompletionValue(List<ResourcePack> originals, PackProfile profile) throws Exception {
+        StringBuilder identity = new StringBuilder(REWRITE_REVISION).append('\n')
+                .append(profile.name()).append('\n')
+                .append(activeSetFingerprint).append('\n')
+                .append(activePackStackFingerprint).append('\n');
+        for (ResourcePack original : originals) {
+            identity.append(original.uuid()).append(':').append(fingerprint(original, profile)).append('\n');
+        }
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(identity.toString().getBytes(StandardCharsets.UTF_8))) + "\n";
+    }
+
+    private boolean isValidSetCompletion(Path marker, List<ResourcePack> originals, PackProfile profile) throws Exception {
+        return Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS) && Files.size(marker) <= 128
+                && Files.readString(marker, StandardCharsets.UTF_8).equals(setCompletionValue(originals, profile));
+    }
+
+    private void writeSetCompletion(Path marker, List<ResourcePack> originals, PackProfile profile) throws Exception {
+        Path temporary = Files.createTempFile(cacheDirectory, "." + marker.getFileName() + "-", ".tmp");
+        try {
+            Files.writeString(temporary, setCompletionValue(originals, profile), StandardCharsets.UTF_8);
+            moveIntoPlace(temporary, marker);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    private boolean completeSetMembers(
+            List<ResourcePack> originals,
+            PackProfile profile,
+            Map<UUID, PreparedVariant> variants) {
+        if (variants.size() != originals.size()) return false;
+        for (ResourcePack original : originals) {
+            PreparedVariant variant = variants.get(original.uuid());
+            if (variant == null || !variant.fingerprint().equals(fingerprint(original, profile))
+                    || variant.audit().getOpaqueBedrockArchivePresent()) return false;
+            if (variant.file() != null) {
+                if (!isVerifiedArtifact(variant.file(), variant.fingerprint())) return false;
+            } else if (profile != PackProfile.OPTIMIZE_FULL || variant.pack() != original) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean activeSetCompletionValid(PackProfile profile) {
+        if (activeOriginals.isEmpty()) return false;
+        try {
+            return isValidSetCompletion(setCompletionFile(activeOriginals, profile), activeOriginals, profile);
+        } catch (Exception | LinkageError invalidCompletionRecord) {
+            return false;
+        }
     }
 
     private static Path noChangeMarker(Path output) {
@@ -833,15 +986,33 @@ final class PackVariantManager {
         }
     }
 
-    private String packSetFingerprint(List<ResourcePack> packs, Map<UUID, String> sourceHashes) throws Exception {
+    private String packSetFingerprint(
+            List<ResourcePack> packs,
+            Map<UUID, String> sourceHashes,
+            Map<UUID, String> optionFingerprints) throws Exception {
         StringBuilder identity = new StringBuilder();
-        for (ResourcePack pack : packs.stream()
-                .sorted(java.util.Comparator.comparing(candidate -> candidate.uuid().toString())).toList()) {
+        for (ResourcePack pack : packs) {
             identity.append(pack.uuid()).append(':')
-                .append(sourceHashes.getOrDefault(pack.uuid(), "")).append('\n');
+                .append(sourceHashes.getOrDefault(pack.uuid(), "")).append(':')
+                .append(optionFingerprints.getOrDefault(pack.uuid(), "")).append('\n');
         }
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(identity.toString().getBytes(StandardCharsets.UTF_8)));
+    }
+
+    static String optionFingerprint(Collection<ResourcePackOption<?>> options) {
+        return options.stream().filter(java.util.Objects::nonNull)
+                .map(option -> option.type().name() + "=" + String.valueOf(option.value()))
+                .sorted().collect(java.util.stream.Collectors.joining("\n"));
+    }
+
+    private static Map<UUID, String> optionFingerprints(
+            Map<UUID, ? extends Collection<ResourcePackOption<?>>> options) {
+        if (options == null || options.isEmpty()) return Map.of();
+        Map<UUID, String> fingerprints = new HashMap<>();
+        options.forEach((uuid, values) -> fingerprints.put(uuid,
+                optionFingerprint(values == null ? List.of() : values)));
+        return Map.copyOf(fingerprints);
     }
 
     private String fingerprint(ResourcePack original, PackProfile profile) {
@@ -852,6 +1023,18 @@ final class PackVariantManager {
 
     static String sourceHash(ResourcePack original) {
         var codec = original.codec();
+        if (!(codec instanceof PathPackCodec)) {
+            String providerIdentity = codec instanceof UrlPackCodec urlCodec
+                    ? "url:" + urlCodec.url()
+                    : "unsupported:" + codec.getClass().getName() + ":" + System.identityHashCode(original);
+            String identity = original.uuid() + ":" + providerIdentity + ":" + String.valueOf(original.contentKey());
+            try {
+                return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                        .digest(identity.getBytes(StandardCharsets.UTF_8)));
+            } catch (Exception impossible) {
+                throw new IllegalStateException(impossible);
+            }
+        }
         synchronized (codec) {
             return HexFormat.of().formatHex(codec.sha256());
         }

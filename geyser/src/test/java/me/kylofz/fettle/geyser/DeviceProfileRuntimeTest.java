@@ -24,6 +24,21 @@ class DeviceProfileRuntimeTest {
     private static final UUID PACK_ID = UUID.fromString("e64da2bc-9df9-4d1a-975c-32f472350d70");
 
     @Test
+    void summarizesRejectedSelectionsEvenWhenNoSessionSnapshotWasRecorded() {
+        DeviceProfileRuntime runtime = new DeviceProfileRuntime();
+
+        runtime.recordRejectedSelection(DeviceProfilePolicy.Status.OVER_BUDGET);
+        runtime.recordRejectedSelection(DeviceProfilePolicy.Status.UNMEASURED);
+        runtime.recordRejectedSelection(DeviceProfilePolicy.Status.OVER_BUDGET);
+
+        assertEquals(Map.of(
+                DeviceProfilePolicy.Status.OVER_BUDGET, 2L,
+                DeviceProfilePolicy.Status.UNMEASURED, 1L), runtime.summary().rejectedSelectionCounts());
+        runtime.clearSessions();
+        assertTrue(runtime.summary().rejectedSelectionCounts().isEmpty());
+    }
+
+    @Test
     void geyserExposedClientDataFlowsIntoAutomaticSelectionWithoutPairing() {
         String payload = "{\"DeviceOS\":7,\"DeviceModel\":\"Example Phone\","
                 + "\"GameVersion\":\"1.26.10\",\"MemoryTier\":3,\"MaxViewDistance\":32,"
@@ -72,9 +87,9 @@ class DeviceProfileRuntimeTest {
         assertEquals(Map.of("OPTIMIZE_MINI", 5), live.profileSets());
         assertEquals(5, live.selectionOutcomes().values().stream().mapToInt(Integer::intValue).sum());
         assertEquals(1, live.selectionOutcomes().get(
-                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.52, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits"));
+                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.52, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy"));
         assertEquals(1, live.selectionOutcomes().get(
-                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.51, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits"));
+                "platform iOS (DeviceOS 2), protocol 786, game version 1.26.51, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy"));
         assertEquals(5, live.pendingInitialization().values().stream().mapToInt(Integer::intValue).sum());
         assertEquals(Map.of(2, 1), live.memoryTiers());
         assertEquals(Map.of("iOS (DeviceOS 2) [MemoryTier 2, game version 1.26.52, protocol 786]", 1), live.memoryTiersByPlatform());
@@ -103,19 +118,19 @@ class DeviceProfileRuntimeTest {
         assertTrue(summary.pendingInitialization().isEmpty());
         assertEquals(5, summary.packJoinAttemptCounts().values().stream().mapToLong(Long::longValue).sum());
         assertEquals(Map.of(
-                "platform iOS (DeviceOS 2), protocol 786, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits", 1L,
-                "platform iOS (DeviceOS 2), protocol 786, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
+                "platform iOS (DeviceOS 2), protocol 786, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L,
+                "platform iOS (DeviceOS 2), protocol 786, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L),
                 summary.postInitializationJoinCounts());
         assertEquals(summary.postInitializationJoinCounts().keySet(),
                 summary.postInitializationAverageMillis().keySet());
         assertTrue(summary.postInitializationAverageMillis().values().stream().allMatch(value -> value >= 0));
         assertEquals(3, summary.preInitializationDisconnectCounts().values().stream().mapToLong(Long::longValue).sum());
         assertEquals(Map.of(
-                "platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L,
-                "platform Bedrock platform IOS, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L,
-                "platform unknown, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
+                "platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L,
+                "platform Bedrock platform IOS, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L,
+                "platform unknown, protocol 786, graphics mode unknown, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L),
                 summary.preInitializationDisconnectCounts());
-        assertEquals(Map.of("platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits", 1L),
+        assertEquals(Map.of("platform Android (DeviceOS 1), protocol 786, graphics mode 1, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L),
                 summary.resourcePackReasonDisconnectCounts());
         runtime.clearSessions();
         assertTrue(runtime.summary().pendingInitialization().isEmpty());
