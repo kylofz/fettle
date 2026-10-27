@@ -94,13 +94,14 @@ public class PackOptimizer {
 
     private data class JsonRange(val start: Int, val endExclusive: Int)
 
-    private data class UvAnimationScan(
+    internal data class UvAnimationScan(
         val textureAliasesByController: Map<String, Set<String>?>,
         val geometryTextureAliasesByController: Map<String, List<GeometryTextureAliases>?>,
         val complete: Boolean,
+        val bytesScanned: Long = 0,
     )
 
-    private data class GeometryTextureAliases(val geometry: String, val texture: String)
+    internal data class GeometryTextureAliases(val geometry: String, val texture: String)
 
     private data class PackEntryKey(val packIndex: Int, val path: String)
 
@@ -293,6 +294,14 @@ public class PackOptimizer {
         require(inputs.isNotEmpty()) { "At least one input pack is required" }
         require(inputs.size == outputs.size) { "Each input pack needs one output path" }
         require(maxTextureDimension >= 0) { "Maximum texture dimension cannot be negative" }
+        val normalizedInputs = inputs.map { it.toAbsolutePath().normalize() }
+        val normalizedOutputs = outputs.map { it.toAbsolutePath().normalize() }
+        require(normalizedOutputs.toSet().size == normalizedOutputs.size) {
+            "Each input pack needs a distinct output path"
+        }
+        require(normalizedOutputs.indices.all { index ->
+            normalizedOutputs[index] !in normalizedInputs || normalizedOutputs[index] == normalizedInputs[index]
+        }) { "A pack-set output cannot overwrite another input pack" }
         require(manifestHeaderUuids == null || manifestHeaderUuids.size == inputs.size) {
             "Each input pack needs one replacement manifest UUID"
         }
@@ -363,10 +372,10 @@ public class PackOptimizer {
 
             for (packIndex in zips.indices) {
                 val zip = zips[packIndex]
-                mergeControllerAliases(
-                    geometryTextureAliasesByController,
-                    findUvAnimationControllers(zip).geometryTextureAliasesByController,
-                )
+                val uvScan = findUvAnimationControllers(zip, MAX_PACK_SET_SCAN_BYTES - scannedBytes)
+                scannedBytes += uvScan.bytesScanned
+                if (scannedBytes > MAX_PACK_SET_SCAN_BYTES) return emptyList()
+                mergeControllerAliases(geometryTextureAliasesByController, uvScan.geometryTextureAliasesByController)
                 val entries = zip.entries()
                 var entriesScanned = 0
                 while (entries.hasMoreElements()) {
@@ -771,7 +780,8 @@ public class PackOptimizer {
 
         try {
             ZipFile(input.toFile()).use { zip ->
-                val uvAnimationScan = findUvAnimationControllers(zip)
+                val uvAnimationScan = findUvAnimationControllers(zip, MAX_UV_ANIMATION_SCAN_BYTES)
+                scannedBytes += uvAnimationScan.bytesScanned
                 if (!uvAnimationScan.complete) hasUnclassifiedUvAnimation = true
                 val entries = zip.entries()
                 var entriesScanned = 0
@@ -792,12 +802,10 @@ public class PackOptimizer {
                             if (strings == null) {
                                 hasUnresolvedTextureSet = true
                             } else {
-                                strings.mapNotNull(::textureEntryName)
-                                    .mapTo(preserveResolutionTextures) { it.lowercase(Locale.ROOT) }
+                                strings.flatMap(::textureSetResolutionPaths)
+                                    .forEach(preserveResolutionTextures::add)
                                 val stem = name.dropLast(".texture_set.json".length)
-                                preserveResolutionTextures += "$stem.png".lowercase(Locale.ROOT)
-                                preserveResolutionTextures += "${stem}_normal.png".lowercase(Locale.ROOT)
-                                preserveResolutionTextures += "${stem}_mer.png".lowercase(Locale.ROOT)
+                                preserveResolutionTextures += textureSetDefaultResolutionPaths(stem)
                             }
                         }
                     }
@@ -1089,7 +1097,7 @@ public class PackOptimizer {
                     unsafeGeometryTextures = unsafeGeometryTextures,
                     preserveResolutionTextures = preserveResolutionTextures,
                     disableTextureResizing = maxTextureDimension > 0 &&
-                        (hasUnresolvedAssetReferences || hasUnresolvedTextureSet),
+                        (hasUnresolvedAssetReferences || hasUnresolvedTextureSet || hasUnclassifiedUvAnimation),
                 )
             }
         } catch (_: IOException) {
@@ -1163,7 +1171,9 @@ public class PackOptimizer {
 
             for (packIndex in zips.indices) {
                 val zip = zips[packIndex]
-                val uvScan = findUvAnimationControllers(zip)
+                val uvScan = findUvAnimationControllers(zip, MAX_PACK_SET_SCAN_BYTES - scannedBytes)
+                scannedBytes += uvScan.bytesScanned
+                if (scannedBytes > MAX_PACK_SET_SCAN_BYTES) return emptyPlans()
                 if (!uvScan.complete) unknownUvAnimation = true
                 for ((controller, aliases) in uvScan.textureAliasesByController) {
                     if (!animatedAliasesByController.containsKey(controller)) {
@@ -1214,11 +1224,9 @@ public class PackOptimizer {
                     val strings = JsonStringScanner.read(text) ?: return emptyPlans()
                     if (name.endsWith(".texture_set.json", ignoreCase = true)) {
                         val stem = name.dropLast(".texture_set.json".length)
-                        preserveResolutionTexturePaths += "$stem.png".lowercase(Locale.ROOT)
-                        preserveResolutionTexturePaths += "${stem}_normal.png".lowercase(Locale.ROOT)
-                        preserveResolutionTexturePaths += "${stem}_mer.png".lowercase(Locale.ROOT)
-                        strings.mapNotNull(::textureEntryName)
-                            .mapTo(preserveResolutionTexturePaths) { it.lowercase(Locale.ROOT) }
+                        preserveResolutionTexturePaths += textureSetDefaultResolutionPaths(stem)
+                        strings.flatMap(::textureSetResolutionPaths)
+                            .forEach(preserveResolutionTexturePaths::add)
                     }
                     if (text.contains("\"uv_anim\"") && !name.startsWith(RENDER_CONTROLLERS_PATH, ignoreCase = true)) {
                         unknownUvAnimation = true
@@ -2065,16 +2073,17 @@ public class PackOptimizer {
         return entriesByPath[path]?.singleOrNull()
     }
 
-    private fun findUvAnimationControllers(zip: ZipFile): UvAnimationScan {
+    internal fun findUvAnimationControllers(zip: ZipFile, maxScanBytes: Long): UvAnimationScan {
         val textureAliasesByController = HashMap<String, Set<String>?>()
         val geometryTextureAliasesByController = HashMap<String, List<GeometryTextureAliases>?>()
         var complete = true
+        var scannedBytes = 0L
         val entries = zip.entries()
         var entriesScanned = 0
         while (entries.hasMoreElements()) {
             val entry = entries.nextElement()
             if (++entriesScanned > MAX_ZIP_ENTRIES) {
-                return UvAnimationScan(emptyMap(), emptyMap(), complete = false)
+                return UvAnimationScan(emptyMap(), emptyMap(), complete = false, bytesScanned = scannedBytes)
             }
             if (entry.isDirectory || !entry.name.startsWith(RENDER_CONTROLLERS_PATH, ignoreCase = true) ||
                 !entry.name.endsWith(".json", ignoreCase = true)
@@ -2083,11 +2092,17 @@ public class PackOptimizer {
                 complete = false
                 continue
             }
+            val remaining = maxScanBytes - scannedBytes
+            if (entry.size < 0L || entry.size > remaining) {
+                return UvAnimationScan(textureAliasesByController, geometryTextureAliasesByController,
+                    complete = false, bytesScanned = scannedBytes)
+            }
             val bytes = zip.getInputStream(entry).use { readBounded(it, MAX_JSON_BYTES) }
             if (bytes == null) {
-                complete = false
-                continue
+                return UvAnimationScan(textureAliasesByController, geometryTextureAliasesByController,
+                    complete = false, bytesScanned = maxScanBytes)
             }
+            scannedBytes += bytes.size
             val text = try {
                 StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPORT)
@@ -2126,7 +2141,7 @@ public class PackOptimizer {
             }
             if (hasUvAnimation && !classified) complete = false
         }
-        return UvAnimationScan(textureAliasesByController, geometryTextureAliasesByController, complete)
+        return UvAnimationScan(textureAliasesByController, geometryTextureAliasesByController, complete, scannedBytes)
     }
 
     private fun matchingJsonObjectEnd(text: String, openBrace: Int): Int? {
@@ -2723,6 +2738,20 @@ public class PackOptimizer {
         return if (updated == text) bytes else updated.toByteArray(StandardCharsets.UTF_8)
     }
 
+    private fun textureSetResolutionPaths(value: String): List<String> {
+        val raw = value.substringBefore('#').trim()
+        if (raw.isEmpty() || raw.contains('\\') || raw.startsWith('/')) return emptyList()
+        val path = if (raw.startsWith("textures/", ignoreCase = true)) raw else "textures/$raw"
+        val normalized = path.lowercase(Locale.ROOT)
+        return if (TEXTURE_SET_RASTER_EXTENSIONS.any { normalized.endsWith(it) }) listOf(normalized)
+        else TEXTURE_SET_RASTER_EXTENSIONS.map { "$normalized$it" }
+    }
+
+    private fun textureSetDefaultResolutionPaths(stem: String): Set<String> =
+        listOf(stem, "${stem}_normal", "${stem}_mer")
+            .flatMap(::textureSetResolutionPaths)
+            .toSet()
+
     private fun textureEntryName(value: String): String? {
         val raw = value.substringBefore('#').trim()
         if (raw.isEmpty() || raw.contains('\\') || raw.startsWith('/')) return null
@@ -2918,6 +2947,7 @@ public class PackOptimizer {
         const val ENTITY_GEOMETRY_PATH = "models/entity/"
         const val RENDER_CONTROLLERS_PATH = "render_controllers/"
         const val FLIPBOOK_TEXTURES_PATH = "textures/flipbook_textures.json"
+        val TEXTURE_SET_RASTER_EXTENSIONS = listOf(".tga", ".png", ".jpg", ".jpeg")
         const val STITCHED_TEXTURE_PATH = "textures/stitched/"
         const val ITEM_TEXTURE_JSON_PATH = "textures/item_texture.json"
         const val JAVA_RENDERED_ITEM_PATH = "textures/items/java_rendered/"
@@ -2930,11 +2960,12 @@ public class PackOptimizer {
         private val FONT_GLYPH_ATLAS_PATH = Regex("^(?:font|texts/[^/]+/font)/glyph_[0-9a-f]{2}\\.png$", RegexOption.IGNORE_CASE)
         const val MAX_JSON_BYTES = 8 * 1024 * 1024
         const val MAX_PRUNE_SCAN_BYTES = 128 * 1024 * 1024L
+        const val MAX_UV_ANIMATION_SCAN_BYTES = 64 * 1024 * 1024L
         const val MAX_PACK_SET_SCAN_BYTES = 256 * 1024 * 1024L
         const val MAX_PNG_BYTES = 64 * 1024 * 1024
         const val MAX_OTHER_RASTER_BYTES = 256 * 1024 * 1024
         const val MIN_FONT_GLYPH_TEXTURE_DIMENSION = 256
-        const val MAX_ZIP_ENTRIES = 100_000
+        const val MAX_ZIP_ENTRIES = MAX_ZIP_ENTRY_COUNT
         const val MAX_PACK_SET_FILES = 128
         const val MAX_ENTRY_EXPANDED_BYTES = 256L * 1024 * 1024
         const val MAX_PACK_EXPANDED_BYTES = 2L * 1024 * 1024 * 1024

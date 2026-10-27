@@ -1529,6 +1529,75 @@ class PackOptimizerTest {
     }
 
     @Test
+    fun miniProfileKeepsTexturesUnchangedWhenUvAnimationScanIsIncomplete() {
+        withTempDirectory { root ->
+            val image = ByteArrayOutputStream().also {
+                ImageIO.write(BufferedImage(512, 512, BufferedImage.TYPE_INT_ARGB), "png", it)
+            }.toByteArray()
+            val input = root.resolve("unknown-uv-controller.mcpack")
+            val output = root.resolve("unknown-uv-controller-mini.mcpack")
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "render_controllers/unknown.json" to
+                    """{"unknown":{"uv_anim":{"texture":"textures/animated"}}}""".toByteArray(),
+                "textures/animated.png" to image,
+            ))
+
+            val rewrite = PackOptimizer().optimizeMini(input, output, emptyList(), 128)
+
+            assertEquals(0, rewrite.pngEntriesOptimized)
+            ZipFile(output.toFile()).use { zip ->
+                assertEquals(512, ImageIO.read(zip.getInputStream(zip.getEntry("textures/animated.png"))).width)
+            }
+        }
+    }
+
+    @Test
+    fun uvControllerScanStopsAtItsByteBudget() {
+        withTempDirectory { root ->
+            val input = root.resolve("uv-scan-budget.mcpack")
+            val json = ByteArray(512 * 1024) { ' '.code.toByte() }.also {
+                it[0] = '{'.code.toByte()
+                it[1] = '}'.code.toByte()
+            }
+            writePack(input, (0 until 3).associate { index ->
+                "render_controllers/controller_$index.json" to json
+            })
+
+            val scan = ZipFile(input.toFile()).use {
+                PackOptimizer().findUvAnimationControllers(it, 1024L * 1024L)
+            }
+
+            assertFalse(scan.complete)
+            assertEquals(1024L * 1024L, scan.bytesScanned)
+        }
+    }
+
+    @Test
+    fun miniProfileKeepsTexturesUnchangedWhenUvAnimationIsUnclassified() {
+        withTempDirectory { root ->
+            val image = ByteArrayOutputStream().also {
+                ImageIO.write(BufferedImage(512, 512, BufferedImage.TYPE_INT_ARGB), "png", it)
+            }.toByteArray()
+            val input = root.resolve("unknown-uv-controller.mcpack")
+            val output = root.resolve("unknown-uv-controller-mini.mcpack")
+            writePack(input, mapOf(
+                "manifest.json" to "{}".toByteArray(),
+                "render_controllers/unknown.json" to
+                    """{"unknown":{"uv_anim":{"texture":"textures/animated"}}}""".toByteArray(),
+                "textures/animated.png" to image,
+            ))
+
+            val rewrite = PackOptimizer().optimizeMini(input, output, emptyList(), 128)
+
+            assertEquals(0, rewrite.pngEntriesOptimized)
+            ZipFile(output.toFile()).use { zip ->
+                assertEquals(512, ImageIO.read(zip.getInputStream(zip.getEntry("textures/animated.png"))).width)
+            }
+        }
+    }
+
+    @Test
     fun losslessSetSharesPixelIdenticalAttachableTexturesOnlyInsideLinkedPackGroups() {
         withTempDirectory { root ->
             val base = root.resolve("base.mcpack")
@@ -2295,6 +2364,28 @@ class PackOptimizerTest {
     }
 
     @Test
+    fun packSetRewriteRejectsOutputPathCollisionsBeforeWriting() {
+        withTempDirectory { root ->
+            val first = root.resolve("first.mcpack")
+            val second = root.resolve("second.mcpack")
+            writePack(first, mapOf("manifest.json" to "{}".toByteArray()))
+            writePack(second, mapOf("manifest.json" to "{}".toByteArray()))
+            val firstBytes = Files.readAllBytes(first)
+            val secondBytes = Files.readAllBytes(second)
+            val optimizer = PackOptimizer()
+
+            assertFailsWith<IllegalArgumentException> {
+                optimizer.optimizeResizedPackSet(listOf(first, second), listOf(second, first), 128)
+            }
+            assertFailsWith<IllegalArgumentException> {
+                optimizer.optimizeResizedPackSet(listOf(first, second), listOf(first, first), 128)
+            }
+            assertContentEquals(firstBytes, Files.readAllBytes(first))
+            assertContentEquals(secondBytes, Files.readAllBytes(second))
+        }
+    }
+
+    @Test
     fun miniProfileReducesTextureDimensionsExplicitly() {
         withTempDirectory { root ->
             val input = root.resolve("input.mcpack")
@@ -3032,6 +3123,19 @@ class PackOptimizerTest {
                 val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
                 return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
             }
+            fun jpeg(width: Int, height: Int): ByteArray {
+                val image = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
+                return ByteArrayOutputStream().also { ImageIO.write(image, "jpg", it) }.toByteArray()
+            }
+            fun tga(width: Int, height: Int): ByteArray = ByteArray(18 + width * height * 3).apply {
+                this[2] = 2
+                this[12] = width.toByte()
+                this[13] = (width ushr 8).toByte()
+                this[14] = height.toByte()
+                this[15] = (height ushr 8).toByte()
+                this[16] = 24
+                this[17] = 0x20
+            }
 
             val input = root.resolve("input.mcpack")
             val output = root.resolve("output.mcpack")
@@ -3044,6 +3148,14 @@ class PackOptimizerTest {
                 "textures/model/pbr_mer.png" to png(512, 512),
                 "textures/model/pbr.texture_set.json" to
                     """{"format_version":"1.21.30","minecraft:texture_set":{"color":"pbr","normal":"pbr_normal","metalness_emissive_roughness":"pbr_mer"}}""".toByteArray(),
+                "textures/model/tga_pbr.tga" to tga(256, 128),
+                "textures/model/tga_pbr_normal.tga" to tga(256, 128),
+                "textures/model/tga_pbr_mer.tga" to tga(256, 128),
+                "textures/model/tga_pbr.texture_set.json" to
+                    """{"format_version":"1.21.30","minecraft:texture_set":{"color":"tga_pbr","normal":"tga_pbr_normal","metalness_emissive_roughness":"tga_pbr_mer"}}""".toByteArray(),
+                "textures/model/jpeg_pbr.jpg" to jpeg(256, 128),
+                "textures/model/jpeg_pbr.texture_set.json" to
+                    """{"format_version":"1.21.30","minecraft:texture_set":{"color":"textures/model/jpeg_pbr.jpg"}}""".toByteArray(),
             ))
 
             PackOptimizer().optimizeSafe(input, output, 128)
@@ -3052,12 +3164,22 @@ class PackOptimizerTest {
                 fun dimensions(path: String): Pair<Int, Int> = ImageIO.read(zip.getInputStream(zip.getEntry(path))).let {
                     it.width to it.height
                 }
+                fun tgaDimensions(path: String): Pair<Int, Int> = zip.getInputStream(zip.getEntry(path)).use { input ->
+                    val header = input.readNBytes(18)
+                    val width = (header[12].toInt() and 0xff) or ((header[13].toInt() and 0xff) shl 8)
+                    val height = (header[14].toInt() and 0xff) or ((header[15].toInt() and 0xff) shl 8)
+                    width to height
+                }
                 assertEquals(128 to 64, dimensions("textures/blocks/ordinary.png"))
                 assertEquals(512 to 512, dimensions("textures/ui/icon.png"))
                 assertEquals(256 to 256, dimensions("font/glyph_E0.png"))
                 assertEquals(512 to 512, dimensions("textures/model/pbr.png"))
                 assertEquals(512 to 512, dimensions("textures/model/pbr_normal.png"))
                 assertEquals(512 to 512, dimensions("textures/model/pbr_mer.png"))
+                assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr.tga"))
+                assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr_normal.tga"))
+                assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr_mer.tga"))
+                assertEquals(256 to 128, dimensions("textures/model/jpeg_pbr.jpg"))
             }
         }
     }
@@ -3068,6 +3190,15 @@ class PackOptimizerTest {
             fun png(size: Int): ByteArray {
                 val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
                 return ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+            }
+            fun tga(width: Int, height: Int): ByteArray = ByteArray(18 + width * height * 3).apply {
+                this[2] = 2
+                this[12] = width.toByte()
+                this[13] = (width ushr 8).toByte()
+                this[14] = height.toByte()
+                this[15] = (height ushr 8).toByte()
+                this[16] = 24
+                this[17] = 0x20
             }
 
             val input = root.resolve("pbr.mcpack")
@@ -3085,6 +3216,11 @@ class PackOptimizerTest {
                 "textures/model/pbr_mer.png" to png(512),
                 "textures/model/pbr.texture_set.json" to
                     """{"format_version":"1.21.30","minecraft:texture_set":{"color":"pbr","normal":"pbr_normal","metalness_emissive_roughness":"pbr_mer"}}""".toByteArray(),
+                "textures/model/tga_pbr.tga" to tga(256, 128),
+                "textures/model/tga_pbr_normal.tga" to tga(256, 128),
+                "textures/model/tga_pbr_mer.tga" to tga(256, 128),
+                "textures/model/tga_pbr.texture_set.json" to
+                    """{"format_version":"1.21.30","minecraft:texture_set":{"color":"tga_pbr","normal":"tga_pbr_normal","metalness_emissive_roughness":"tga_pbr_mer"}}""".toByteArray(),
             ))
 
             PackOptimizer().optimizeSafe(input, resizedOutput, 128)
@@ -3093,9 +3229,17 @@ class PackOptimizerTest {
 
             fun assertPbrAssetsAndUvRemainAligned(path: Path) {
                 ZipFile(path.toFile()).use { zip ->
+                    fun tgaDimensions(name: String): Pair<Int, Int> = zip.getInputStream(zip.getEntry(name)).use { input ->
+                        val header = input.readNBytes(18)
+                        ((header[12].toInt() and 0xff) or ((header[13].toInt() and 0xff) shl 8)) to
+                            ((header[14].toInt() and 0xff) or ((header[15].toInt() and 0xff) shl 8))
+                    }
                     val source = zip.getInputStream(zip.getEntry("textures/model/pbr.png")).use(ImageIO::read)
                     assertEquals(512 to 512, source.width to source.height)
                     assertTrue(zip.getEntry("textures/model/pbr.texture_set.json") != null)
+                    assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr.tga"))
+                    assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr_normal.tga"))
+                    assertEquals(256 to 128, tgaDimensions("textures/model/tga_pbr_mer.tga"))
                     val rewrittenGeometry = zip.getInputStream(zip.getEntry("models/entity/pbr.geo.json"))
                         .use { it.readBytes().decodeToString() }
                     assertTrue(rewrittenGeometry.contains("\"texture_width\":512"))

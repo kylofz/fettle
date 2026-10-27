@@ -132,7 +132,8 @@ final class DeviceProfilePolicy {
         if (fixed != null) {
             Map<UUID, PackProfile> selected = new LinkedHashMap<>();
             packIds.forEach(id -> selected.put(id, fixed));
-            return summarize(selected, variants, budget, fixedTextureMemoryBytes, fixedTextureFileCount,
+            long fixedBudget = budgetKnown ? budget : conservativeUnknownTierBudget(textureBudgetOverrides);
+            return summarize(selected, variants, fixedBudget, fixedTextureMemoryBytes, fixedTextureFileCount,
                     fixedMetricsComplete, budgetKnown, fixedItemAtlasTextureMemoryBytes,
                     fixedBlockAtlasTextureMemoryBytes, fixedAtlasMetricsComplete, fixedPackFileCount,
                     maxPackFileCount, fixedTextureHandleUpperBound, fixedHandleMetricsComplete,

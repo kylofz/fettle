@@ -78,6 +78,18 @@ class BedrockDeviceCapabilitiesTest {
     }
 
     @Test
+    fun rejectsOversizedNumericTokensBeforeConvertingThem() {
+        val capabilities = BedrockDeviceCapabilities.fromGeyserClientDataJwt(
+            jwt("{\"MemoryTier\":${"9".repeat(1_000)}}"),
+            "ANDROID",
+        )
+
+        assertFalse(capabilities.clientDataDecoded)
+        assertEquals(MemoryTierClaimStatus.UNDECODABLE, capabilities.memoryTierClaimStatus)
+        assertNull(capabilities.memoryTier)
+    }
+
+    @Test
     fun describesMemoryTierWithoutImplyingARamMeasurement() {
         val descriptions = (0..4).map { tier ->
             BedrockDeviceCapabilities.fromGeyserClientDataJwt(jwt("""{"MemoryTier":$tier}"""), null)

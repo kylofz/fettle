@@ -9,6 +9,7 @@ import org.geysermc.geyser.api.pack.option.ResourcePackOption.Type;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -48,6 +49,19 @@ class FettlePackReplacementTest {
                 "§cFettle could not prepare or validate this server's required resource packs. Contact the server administrator.",
                 message.get());
         assertEquals(List.of(target), event.resourcePacks());
+    }
+
+    @Test
+    void vibrantVisualsIsDisabledOnlyWhenTheOperatorConfiguresIt() throws Exception {
+        FettleExtension extension = new FettleExtension();
+        Field setting = FettleExtension.class.getDeclaredField("disableVibrantVisuals");
+        setting.setAccessible(true);
+        setting.set(extension, true);
+        FakeEvent event = new FakeEvent(connection(), List.of());
+
+        extension.onLoadResourcePacks(event);
+
+        assertFalse(event.vibrantVisualsAllowed);
     }
 
     @Test
@@ -264,6 +278,7 @@ class FettlePackReplacementTest {
         private ResourcePack failPack;
         private ResourcePack failRestorePack;
         private UUID failUnregisterOnce;
+        private boolean vibrantVisualsAllowed = true;
 
         private FakeEvent(GeyserConnection connection, ResourcePack original, List<ResourcePackOption<?>> initialOptions) {
             super(connection);
@@ -323,6 +338,7 @@ class FettlePackReplacementTest {
 
         @Override
         public void allowVibrantVisuals(boolean allow) {
+            vibrantVisualsAllowed = allow;
         }
     }
 }

@@ -43,6 +43,12 @@ public class PackAuditReport @JvmOverloads constructor(
     public val opaqueBedrockArchivePresent: Boolean = false,
     /** True when Fettle cannot safely inspect or rewrite this codec/content identity. */
     public val optimizationUnsupported: Boolean = false,
+    /** Supported sound files under sounds/, not their decoded or cached runtime memory. */
+    public val soundAssetCount: Int = 0,
+    /** ZIP entry bytes for supported sound files under sounds/. */
+    public val soundAssetBytes: Long = 0,
+    /** False when opaque pack data or unknown entry sizes may hide sound assets. */
+    public val soundAssetMetricsComplete: Boolean = true,
 ) {
     public data class TextureHotspot(
         public val path: String,
@@ -89,6 +95,7 @@ public class PackAuditReport @JvmOverloads constructor(
             pngAnimationMetadataCount = 0,
             warnings = listOf(reason),
             optimizationUnsupported = true,
+            soundAssetMetricsComplete = false,
         )
 
         /** Mirrors Creator Tools' atlas allocation estimate: round aggregate texture bytes up to a power of two. */

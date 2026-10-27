@@ -157,6 +157,7 @@ private sealed class JsonScalar {
 private class JsonScalarReader(private val text: String) {
     private companion object {
         const val MAX_DEPTH = 64
+        const val MAX_NUMBER_TOKEN_CHARS = 64
         val CAPTURED_FIELDS = setOf(
             "DeviceOS",
             "DeviceModel",
@@ -310,7 +311,10 @@ private class JsonScalarReader(private val text: String) {
 
     private fun readNumber(): String {
         val start = index
-        while (index < text.length && !isValueDelimiter(text[index])) index++
+        while (index < text.length && !isValueDelimiter(text[index])) {
+            if (index - start == MAX_NUMBER_TOKEN_CHARS) invalid()
+            index++
+        }
         val raw = text.substring(start, index)
         if (!NUMBER.matches(raw)) invalid()
         return raw

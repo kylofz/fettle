@@ -103,6 +103,7 @@ public class PackAuditor {
         var largestModelPath: String? = null
         var maxBlockModelCubes = 0
         var blockModelFilesOver50Cubes = 0
+        var modelScanBytes = 0L
         var unmeasuredTextureCount = 0
         val unmeasuredTextureExamples = ArrayList<String>(3)
         var oversizedModelCount = 0
@@ -115,6 +116,9 @@ public class PackAuditor {
         var rootPackIconDimensions: Dimensions? = null
         var opaqueBedrockArchivePresent = false
         var duplicateEntryCount = 0
+        var soundAssetCount = 0
+        var soundAssetBytes = 0L
+        var soundAssetMetricsComplete = true
         val entryNames = HashSet<String>()
         var textureReferences = TextureReferenceScan(emptySet(), emptySet(), emptySet(), 0, false, false)
 
@@ -137,24 +141,46 @@ public class PackAuditor {
                 val lowerName = entry.name.lowercase(Locale.ROOT)
                 if (lowerName == "pack_icon.png") rootPackIconCount++
                 if (isOpaqueBedrockArchiveEntry(entry.name)) opaqueBedrockArchivePresent = true
+                val normalizedName = lowerName.replace('\\', '/')
+                if (normalizedName.startsWith("sounds/") && SOUND_ASSET_EXTENSIONS.any { normalizedName.endsWith(it) }) {
+                    soundAssetCount++
+                    if (entry.size < 0L) {
+                        soundAssetMetricsComplete = false
+                    } else {
+                        soundAssetBytes = try {
+                            Math.addExact(soundAssetBytes, entry.size)
+                        } catch (_: ArithmeticException) {
+                            throw IOException("Pack's sound asset size overflows a 64-bit counter")
+                        }
+                    }
+                }
                 if (lowerName.endsWith(".png.mcmeta")) pngAnimationMetadataCount++
                 val rootFontGlyph = lowerName.startsWith("font/glyph_") && lowerName.endsWith(".png")
                 if (rootFontGlyph) rootFontGlyphCount++
                 if (lowerName.startsWith("models/") && lowerName.endsWith(".json")) {
                     modelFileCount++
-                    val modelBytes = if (entry.size > MAX_MODEL_BYTES) null else
-                        zip.getInputStream(entry).use { readBounded(it, MAX_MODEL_BYTES) }
+                    val remainingModelScanBytes = MAX_MODEL_SCAN_BYTES - modelScanBytes
+                    val modelBytes = if (entry.size < 0L || entry.size > MAX_MODEL_BYTES ||
+                        entry.size > remainingModelScanBytes
+                    ) null else zip.getInputStream(entry).use { readBounded(it, MAX_MODEL_BYTES) }
                     if (modelBytes == null) {
                         oversizedModelCount++
                     } else {
-                        val cubeCount = totalCubeCount(modelBytes.toString(Charsets.UTF_8))
-                        if (cubeCount > maxModelCubes) {
-                            maxModelCubes = cubeCount
-                            largestModelPath = entry.name
-                        }
-                        if (lowerName.startsWith("models/blocks/")) {
-                            maxBlockModelCubes = maxOf(maxBlockModelCubes, cubeCount)
-                            if (cubeCount > 50) blockModelFilesOver50Cubes++
+                        modelScanBytes += modelBytes.size
+                        val cubeCount = JsonStringScanner.countObjectsInArraysNamed(
+                            modelBytes.toString(Charsets.UTF_8), "cubes"
+                        )
+                        if (cubeCount == null) {
+                            oversizedModelCount++
+                        } else {
+                            if (cubeCount > maxModelCubes) {
+                                maxModelCubes = cubeCount
+                                largestModelPath = entry.name
+                            }
+                            if (lowerName.startsWith("models/blocks/")) {
+                                maxBlockModelCubes = maxOf(maxBlockModelCubes, cubeCount)
+                                if (cubeCount > 50) blockModelFilesOver50Cubes++
+                            }
                         }
                     }
                 }
@@ -338,6 +364,9 @@ public class PackAuditor {
             blockAtlasTextureMemoryBytes = blockAtlasTextureMemoryBytes,
             opaqueBedrockArchivePresent = opaqueBedrockArchivePresent,
             optimizationUnsupported = duplicateEntryCount > 0,
+            soundAssetCount = soundAssetCount,
+            soundAssetBytes = soundAssetBytes,
+            soundAssetMetricsComplete = soundAssetMetricsComplete && !opaqueBedrockArchivePresent,
         )
     }
 
@@ -423,44 +452,6 @@ public class PackAuditor {
             if (total > maximumBytes) return null
             output.write(buffer, 0, read)
         }
-    }
-
-    private fun totalCubeCount(json: String): Int {
-        var total = 0
-        for (match in CUBE_ARRAY_START.findAll(json)) {
-            var arrayDepth = 1
-            var objectDepth = 0
-            var count = 0
-            var inString = false
-            var escaped = false
-            for (index in match.range.last + 1 until json.length) {
-                val character = json[index]
-                if (inString) {
-                    when {
-                        escaped -> escaped = false
-                        character == '\\' -> escaped = true
-                        character == '"' -> inString = false
-                    }
-                    continue
-                }
-                when (character) {
-                    '"' -> inString = true
-                    '[' -> arrayDepth++
-                    ']' -> {
-                        arrayDepth--
-                        if (arrayDepth == 0) break
-                    }
-                    '{' -> {
-                        if (arrayDepth == 1 && objectDepth == 0) count++
-                        objectDepth++
-                    }
-                    '}' -> objectDepth--
-                }
-            }
-            if (Int.MAX_VALUE - total < count) return Int.MAX_VALUE
-            total += count
-        }
-        return total
     }
 
     private fun skipExactly(input: InputStream, byteCount: Int): Boolean {
@@ -612,10 +603,11 @@ public class PackAuditor {
         const val MAX_ATLAS_REFERENCE_TOTAL_BYTES = 64L * MIB
         const val MAX_FILE_COUNT = 100_000
         const val MAX_MODEL_BYTES = 4 * 1024 * 1024
+        const val MAX_MODEL_SCAN_BYTES = 64L * MIB
+        val SOUND_ASSET_EXTENSIONS = setOf(".ogg", ".wav", ".fsb")
         const val MAX_JPEG_HEADER_BYTES = 1024 * 1024
         const val MAX_TEXTURE_DIMENSION = 32_768
         const val MAX_TEXTURE_HOTSPOTS = 3
-        val CUBE_ARRAY_START = Regex("\"cubes\"\\s*:\\s*\\[")
         val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
         val PNG_IHDR_PREFIX = byteArrayOf(0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52)
     }

@@ -16,7 +16,7 @@ final class DeviceProfileRuntime {
     private final DeviceSelectionPlanner planner = new DeviceSelectionPlanner();
     private final Map<GeyserConnection, SessionDeviceSnapshot> sessions = new ConcurrentHashMap<>();
     private final Map<GeyserConnection, Long> selectionStartedNanos = new ConcurrentHashMap<>();
-    private final Map<String, LongAdder> packJoinAttempts = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> successfulPackSelections = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> postInitializationJoins = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> postInitializationElapsedNanos = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> preInitializationDisconnects = new ConcurrentHashMap<>();
@@ -48,7 +48,7 @@ final class DeviceProfileRuntime {
     void putSession(GeyserConnection connection, SessionDeviceSnapshot snapshot) {
         sessions.put(connection, snapshot);
         if (selectionStartedNanos.putIfAbsent(connection, System.nanoTime()) == null) {
-            packJoinAttempts.computeIfAbsent(observationContext(snapshot), ignored -> new LongAdder()).increment();
+            successfulPackSelections.computeIfAbsent(observationContext(snapshot), ignored -> new LongAdder()).increment();
         }
     }
 
@@ -92,7 +92,7 @@ final class DeviceProfileRuntime {
     void clearSessions() {
         sessions.clear();
         selectionStartedNanos.clear();
-        packJoinAttempts.clear();
+        successfulPackSelections.clear();
         postInitializationJoins.clear();
         postInitializationElapsedNanos.clear();
         preInitializationDisconnects.clear();
@@ -107,14 +107,14 @@ final class DeviceProfileRuntime {
         Map<String, Integer> profileSets = new TreeMap<>();
         Map<String, Integer> selectionOutcomes = new TreeMap<>();
         Map<String, Integer> pendingInitialization = new TreeMap<>();
-        Map<String, Long> packJoinAttemptCounts = new TreeMap<>();
+        Map<String, Long> successfulPackSelectionCounts = new TreeMap<>();
         Map<String, Long> postInitializationJoinCounts = new TreeMap<>();
         Map<String, Long> postInitializationAverageMillis = new TreeMap<>();
         Map<String, Long> preInitializationDisconnectCounts = new TreeMap<>();
         Map<String, Long> resourcePackReasonDisconnectCounts = new TreeMap<>();
         Map<DeviceProfilePolicy.Status, Long> rejectedSelectionCounts = new EnumMap<>(DeviceProfilePolicy.Status.class);
         Map<MemoryTierClaimStatus, Integer> memoryTierFailures = new EnumMap<>(MemoryTierClaimStatus.class);
-        packJoinAttempts.forEach((key, count) -> packJoinAttemptCounts.put(key, count.sum()));
+        successfulPackSelections.forEach((key, count) -> successfulPackSelectionCounts.put(key, count.sum()));
         postInitializationJoins.forEach((key, count) -> postInitializationJoinCounts.put(key, count.sum()));
         postInitializationElapsedNanos.forEach((key, elapsed) -> {
             long joins = postInitializationJoinCounts.getOrDefault(key, 0L);
@@ -158,7 +158,7 @@ final class DeviceProfileRuntime {
         }
         return new Summary(sessions.size(), undecodedClientData, missingMemoryTier,
                 missingMemoryTierUnknownPlatform, profileSets, selectionOutcomes, memoryTiers, memoryTiersByPlatform,
-                pendingInitialization, packJoinAttemptCounts, postInitializationJoinCounts, postInitializationAverageMillis,
+                pendingInitialization, successfulPackSelectionCounts, postInitializationJoinCounts, postInitializationAverageMillis,
                 preInitializationDisconnectCounts, resourcePackReasonDisconnectCounts, memoryTierFailures,
                 missingMemoryTierByPlatform, rejectedSelectionCounts);
     }
@@ -233,7 +233,7 @@ final class DeviceProfileRuntime {
             Map<Integer, Integer> memoryTiers,
             Map<String, Integer> memoryTiersByPlatform,
             Map<String, Integer> pendingInitialization,
-            Map<String, Long> packJoinAttemptCounts,
+            Map<String, Long> successfulPackSelectionCounts,
             Map<String, Long> postInitializationJoinCounts,
             Map<String, Long> postInitializationAverageMillis,
             Map<String, Long> preInitializationDisconnectCounts,
@@ -246,7 +246,7 @@ final class DeviceProfileRuntime {
             memoryTiers = Collections.unmodifiableMap(new TreeMap<>(memoryTiers));
             memoryTiersByPlatform = Collections.unmodifiableMap(new TreeMap<>(memoryTiersByPlatform));
             pendingInitialization = Collections.unmodifiableMap(new TreeMap<>(pendingInitialization));
-            packJoinAttemptCounts = Collections.unmodifiableMap(new TreeMap<>(packJoinAttemptCounts));
+            successfulPackSelectionCounts = Collections.unmodifiableMap(new TreeMap<>(successfulPackSelectionCounts));
             postInitializationJoinCounts = Collections.unmodifiableMap(new TreeMap<>(postInitializationJoinCounts));
             postInitializationAverageMillis = Collections.unmodifiableMap(new TreeMap<>(postInitializationAverageMillis));
             preInitializationDisconnectCounts = Collections.unmodifiableMap(new TreeMap<>(preInitializationDisconnectCounts));

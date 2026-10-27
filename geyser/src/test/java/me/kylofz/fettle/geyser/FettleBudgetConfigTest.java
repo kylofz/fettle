@@ -14,15 +14,32 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FettleBudgetConfigTest {
     @Test
+    void leavesVibrantVisualsEnabledByDefault(@TempDir Path directory) throws Exception {
+        Path config = directory.resolve("config.properties");
+        Files.writeString(config, "profile=auto\n");
+        FettleExtension extension = new FettleExtension();
+        setField(extension, "configFile", config);
+
+        Method loadConfig = FettleExtension.class.getDeclaredMethod("loadConfig");
+        loadConfig.setAccessible(true);
+
+        assertTrue((boolean) loadConfig.invoke(extension));
+        assertFalse((boolean) getField(extension, "disableVibrantVisuals"));
+    }
+
+    @Test
     void loadsOperatorTestedTierBudgetsForAutomaticSelection(@TempDir Path directory) throws Exception {
         Path config = directory.resolve("config.properties");
         Properties properties = new Properties();
         properties.setProperty("profile", "auto");
+        properties.setProperty("disable-vibrant-visuals", "true");
         properties.setProperty("texture-budget-memory-tier-3-mib", "600");
         properties.setProperty("texture-budget-unknown-mib", "200");
         UUID matchedPack = UUID.fromString("52ab4cb8-76d5-4f0f-8ca6-3788c23665e2");
@@ -36,6 +53,7 @@ class FettleBudgetConfigTest {
         Method loadConfig = FettleExtension.class.getDeclaredMethod("loadConfig");
         loadConfig.setAccessible(true);
         assertTrue((boolean) loadConfig.invoke(extension));
+        assertTrue((boolean) getField(extension, "disableVibrantVisuals"));
 
         @SuppressWarnings("unchecked")
         Map<Integer, Long> budgets = (Map<Integer, Long>) getField(extension, "textureBudgetOverrides");
@@ -53,6 +71,7 @@ class FettleBudgetConfigTest {
             saved.load(input);
         }
         assertEquals("200", saved.getProperty("texture-budget-unknown-mib"));
+        assertEquals("true", saved.getProperty("disable-vibrant-visuals"));
         assertEquals(matchedPack.toString(), saved.getProperty("match-pack-uuids"));
     }
 
@@ -60,6 +79,21 @@ class FettleBudgetConfigTest {
     void rejectsNoncanonicalPackUuidRules() {
         assertThrows(IllegalArgumentException.class,
                 () -> FettleExtension.parseMatchPackUuids("not-a-uuid"));
+    }
+
+    @Test
+    void malformedUnicodeEscapeDoesNotEscapeConfigSaveFailureHandling(@TempDir Path directory) throws Exception {
+        Path config = directory.resolve("config.properties");
+        byte[] malformed = ("profile=" + '\\' + "uZZZZ\n").getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        Files.write(config, malformed);
+        FettleExtension extension = new FettleExtension();
+        setField(extension, "configFile", config);
+
+        Method saveConfig = FettleExtension.class.getDeclaredMethod("saveConfig");
+        saveConfig.setAccessible(true);
+
+        assertFalse((boolean) saveConfig.invoke(extension));
+        assertArrayEquals(malformed, Files.readAllBytes(config));
     }
 
     private static void setField(Object target, String name, Object value) throws Exception {

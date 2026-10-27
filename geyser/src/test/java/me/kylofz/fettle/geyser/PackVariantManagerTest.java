@@ -5,6 +5,7 @@ import org.geysermc.geyser.api.pack.PathPackCodec;
 import org.geysermc.geyser.api.pack.ResourcePack;
 import org.geysermc.geyser.api.pack.ResourcePackManifest;
 import org.geysermc.geyser.api.pack.UrlPackCodec;
+import org.geysermc.geyser.api.pack.option.ResourcePackOption;
 import me.kylofz.fettle.optimizer.PackAuditReport;
 import me.kylofz.fettle.optimizer.PackOptimizationReport;
 import org.junit.jupiter.api.Test;
@@ -661,7 +662,11 @@ class PackVariantManagerTest {
         Path oldVariant = oldWriter.prepare(oldSource, PackProfile.SAFE).file();
         oldWriter.clear();
         PackVariantManager activeWriter = new PackVariantManager(cacheDirectory, path -> filePack(path, activeId));
-        Path activeVariant = activeWriter.prepare(activeSource, PackProfile.SAFE).file();
+        PackVariantManager.PreparedVariant activePrepared = activeWriter.prepare(activeSource, PackProfile.SAFE);
+        Path activeVariant = activePrepared.file();
+        Object session = new Object();
+        activeWriter.beginSession(session);
+        activeWriter.retainSessionVariants(session, List.of(activePrepared));
         Path operatorFile = cacheDirectory.resolve("operator-note.txt");
         Files.writeString(operatorFile, "keep");
 
@@ -679,6 +684,34 @@ class PackVariantManagerTest {
         assertTrue(Files.isRegularFile(activeVariant.resolveSibling(activeVariant.getFileName() + ".integrity")));
         assertTrue(Files.isRegularFile(operatorFile));
         assertEquals(2, cleanup.deletedFiles());
+
+        PackVariantManager.CacheCleanup afterTransfer = activeWriter.releaseSessionVariants(session);
+        assertFalse(Files.exists(activeVariant));
+        assertFalse(Files.exists(activeVariant.resolveSibling(activeVariant.getFileName() + ".integrity")));
+        assertTrue(Files.isRegularFile(operatorFile));
+        assertEquals(2, afterTransfer.deletedFiles());
+    }
+
+    @Test
+    void keepsPreparedRegistryVariantsActiveDuringCacheCleanup() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("registered-source.mcpack");
+        writePack(sourcePath);
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        Path cacheDirectory = temporaryDirectory.resolve("registered-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        Map<UUID, Map<PackProfile, PackVariantManager.PreparedVariant>> prepared =
+                manager.prepareSet(List.of(source), List.of(source), List.of(PackProfile.SAFE));
+        PackSetAudit audit = PackSetAudit.collect(List.of(source), List.of(source), pack -> true, manager);
+        Path activeVariant = prepared.get(packId).get(PackProfile.SAFE).file();
+        PackVariantManager.PreparedVariant activePrepared = prepared.get(packId).get(PackProfile.SAFE);
+        manager.setActivePreparedFiles(List.of(audit));
+
+        manager.pruneGeneratedArtifacts(0);
+
+        assertTrue(Files.isRegularFile(activeVariant));
+        assertTrue(Files.isRegularFile(activeVariant.resolveSibling(activeVariant.getFileName() + ".integrity")));
+        assertSame(activePrepared, manager.preparedVariantIfCached(source, PackProfile.SAFE));
     }
 
     @Test
@@ -792,6 +825,27 @@ class PackVariantManagerTest {
     }
 
     @Test
+    void perSessionOptionsReuseTheSameTransformedPackFiles() throws Exception {
+        Path sourcePath = temporaryDirectory.resolve("option-cache-source.mcpack");
+        writePack(sourcePath);
+        UUID packId = UUID.fromString("2b2de2dd-aea9-4f60-92d4-1a99622b1c8f");
+        ResourcePack source = filePack(sourcePath, packId);
+        Path cacheDirectory = temporaryDirectory.resolve("option-cache");
+        PackVariantManager manager = new PackVariantManager(cacheDirectory, path -> filePack(path, packId));
+        ResourcePackOption<?> low = subpackOption("low");
+        ResourcePackOption<?> high = subpackOption("high");
+
+        var first = manager.prepareSet(List.of(source), List.of(source), List.of(PackProfile.SAFE),
+                Map.of(packId, List.of(low))).get(packId).get(PackProfile.SAFE);
+        long artifactsBefore = countFiles(cacheDirectory);
+        var second = manager.prepareSet(List.of(source), List.of(source), List.of(PackProfile.SAFE),
+                Map.of(packId, List.of(high))).get(packId).get(PackProfile.SAFE);
+
+        assertEquals(first.file(), second.file());
+        assertEquals(artifactsBefore, countFiles(cacheDirectory));
+    }
+
+    @Test
     void persistsLosslessNoChangeResultsAcrossRestarts() throws Exception {
         Path sourcePath = temporaryDirectory.resolve("unchanged.mcpack");
         try (RawZipBuilder zip = new RawZipBuilder(sourcePath)) {
@@ -860,6 +914,30 @@ class PackVariantManagerTest {
                 zip.closeEntry();
             }
         }
+    }
+
+    private static long countFiles(Path directory) throws IOException {
+        try (Stream<Path> files = Files.list(directory)) {
+            return files.count();
+        }
+    }
+
+    private static ResourcePackOption<String> subpackOption(String value) {
+        return new ResourcePackOption<>() {
+            @Override
+            public Type type() {
+                return Type.SUBPACK;
+            }
+
+            @Override
+            public String value() {
+                return value;
+            }
+
+            @Override
+            public void validate(ResourcePack pack) {
+            }
+        };
     }
 
     private static byte[] manifest(UUID packId) {

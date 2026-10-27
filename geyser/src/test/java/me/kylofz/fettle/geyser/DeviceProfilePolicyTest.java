@@ -223,6 +223,39 @@ class DeviceProfilePolicyTest {
     }
 
     @Test
+    void fixedOptimizedProfileUsesConservativeBudgetWhenMemoryTierIsUnknown() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(
+                id, Map.of(PackProfile.SAFE, audit(350 * MIB)));
+
+        DeviceProfilePolicy.Selection selection = DeviceProfilePolicy.selectAll(
+                PackProfile.SAFE, null, capabilities(null), variants, Map.of(), 0, 0, true);
+
+        assertEquals(PackProfile.SAFE, selection.profiles().get(id));
+        assertEquals(300 * MIB, selection.textureBudgetBytes());
+        assertFalse(selection.budgetKnown());
+        assertFalse(selection.satisfiesPolicy());
+        assertTrue(FettleExtension.mustRejectSelection(false, selection));
+    }
+
+    @Test
+    void onlyAnExplicitOriginalProfileBypassesFailedSafetyPolicy() {
+        UUID id = UUID.randomUUID();
+        Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(
+                id, Map.of(PackProfile.FULL, audit(350 * MIB)));
+        Map<Integer, Long> budgets = Map.of(3, 100 * MIB);
+
+        DeviceProfilePolicy.Selection original = DeviceProfilePolicy.selectAll(
+                PackProfile.FULL, null, capabilities(3), variants, budgets, 0, 0, true);
+        DeviceProfilePolicy.Selection automatic = DeviceProfilePolicy.selectAll(
+                PackProfile.AUTO, null, capabilities(3), variants, budgets, 0, 0, true);
+
+        assertFalse(original.satisfiesPolicy());
+        assertFalse(FettleExtension.mustRejectSelection(false, original));
+        assertTrue(FettleExtension.mustRejectSelection(true, automatic));
+    }
+
+    @Test
     void textureBudgetAndAtlasPolicyAreAppliedAsSeparateMeasurements() {
         UUID id = UUID.randomUUID();
         Map<UUID, Map<PackProfile, PackAuditReport>> variants = Map.of(id, Map.of(

@@ -116,7 +116,7 @@ class DeviceProfileRuntimeTest {
 
         assertEquals(1, summary.trackedSessions());
         assertTrue(summary.pendingInitialization().isEmpty());
-        assertEquals(5, summary.packJoinAttemptCounts().values().stream().mapToLong(Long::longValue).sum());
+        assertEquals(5, summary.successfulPackSelectionCounts().values().stream().mapToLong(Long::longValue).sum());
         assertEquals(Map.of(
                 "platform iOS (DeviceOS 2), protocol 786, graphics mode 2, MemoryTier 2, selected profiles OPTIMIZE_MINI, pack files 1, budget fits, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L,
                 "platform iOS (DeviceOS 2), protocol 786, graphics mode 0, MemoryTier unknown, selected profiles OPTIMIZE_MINI, pack files 1, budget unknown, atlas policy fits, texture handles within Fettle's 4,000-handle estimate policy", 1L),
@@ -134,7 +134,7 @@ class DeviceProfileRuntimeTest {
                 summary.resourcePackReasonDisconnectCounts());
         runtime.clearSessions();
         assertTrue(runtime.summary().pendingInitialization().isEmpty());
-        assertTrue(runtime.summary().packJoinAttemptCounts().isEmpty());
+        assertTrue(runtime.summary().successfulPackSelectionCounts().isEmpty());
         assertTrue(runtime.summary().preInitializationDisconnectCounts().isEmpty());
         assertTrue(runtime.summary().postInitializationJoinCounts().isEmpty());
         assertTrue(runtime.summary().postInitializationAverageMillis().isEmpty());

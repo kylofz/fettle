@@ -10,6 +10,8 @@ import java.util.zip.CRC32
 import java.util.zip.Deflater
 import java.util.zip.DeflaterOutputStream
 
+internal const val MAX_ZIP_ENTRY_COUNT = 0xFFFF
+
 /**
  * Small ZIP writer that knows sizes before writing headers. Java's regular
  * ZipOutputStream emits a 16-byte data descriptor for every streamed entry;
@@ -177,7 +179,7 @@ internal class RawZipBuilder(private val outputFile: Path) : Closeable {
         const val STORED = 0
         const val DEFLATED = 8
         const val UTF8_FLAG = 0x0800
-        const val UINT16_MAX = 0xFFFF
+        const val UINT16_MAX = MAX_ZIP_ENTRY_COUNT
         const val UINT32_MAX = 0xFFFFFFFFL
     }
 }
